@@ -1,0 +1,899 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AnimeMind — RAG Q&A</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=Noto+Sans+KR:wght@300;400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #13131a;
+    --surface2: #1c1c26;
+    --border: #2a2a3a;
+    --accent: #7c6aff;
+    --accent2: #ff6ab0;
+    --accent3: #6af0ff;
+    --text: #e8e8f0;
+    --muted: #6b6b85;
+    --success: #4ade80;
+    --error: #f87171;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Noto Sans KR', sans-serif;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* Background grid */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background-image:
+      linear-gradient(rgba(124,106,255,0.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(124,106,255,0.03) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .app {
+    position: relative;
+    z-index: 1;
+    max-width: 1100px;
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+
+  /* Header */
+  header {
+    padding: 32px 0 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .logo {
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    font-size: 24px;
+    letter-spacing: -0.5px;
+  }
+
+  .logo span { color: var(--accent); }
+  .logo em { color: var(--accent2); font-style: normal; }
+
+  .badge {
+    font-size: 10px;
+    font-family: 'Syne', sans-serif;
+    font-weight: 600;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    padding: 4px 10px;
+    border-radius: 4px;
+    opacity: 0.7;
+  }
+
+  /* Main layout */
+  .main {
+    display: grid;
+    grid-template-columns: 300px 1fr;
+    gap: 24px;
+    padding: 24px 0;
+    min-height: calc(100vh - 100px);
+  }
+
+  /* Sidebar */
+  .sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+
+  .panel-header {
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 13px;
+    letter-spacing: 0.5px;
+    color: var(--muted);
+    text-transform: uppercase;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .panel-body { padding: 16px 18px; }
+
+  /* Upload zone */
+  .upload-zone {
+    border: 2px dashed var(--border);
+    border-radius: 10px;
+    padding: 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.2s;
+    position: relative;
+  }
+
+  .upload-zone:hover, .upload-zone.drag-over {
+    border-color: var(--accent);
+    background: rgba(124,106,255,0.05);
+  }
+
+  .upload-zone input[type=file] {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+
+  .upload-icon { font-size: 28px; margin-bottom: 8px; }
+  .upload-text { font-size: 13px; color: var(--muted); }
+  .upload-text strong { color: var(--accent); }
+
+  /* Form elements */
+  .form-group { margin-bottom: 12px; }
+
+  label {
+    display: block;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 6px;
+    font-weight: 500;
+  }
+
+  input[type=text], select {
+    width: 100%;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 9px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-family: 'Noto Sans KR', sans-serif;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  input[type=text]:focus, select:focus { border-color: var(--accent); }
+  select option { background: var(--surface2); }
+
+  /* Buttons */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px 18px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-weight: 600;
+    font-family: 'Noto Sans KR', sans-serif;
+    cursor: pointer;
+    border: none;
+    transition: all 0.2s;
+    width: 100%;
+  }
+
+  .btn-primary {
+    background: var(--accent);
+    color: white;
+  }
+
+  .btn-primary:hover { background: #6b59ee; transform: translateY(-1px); }
+  .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+  .btn-ghost {
+    background: transparent;
+    color: var(--muted);
+    border: 1px solid var(--border);
+  }
+
+  .btn-ghost:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* Progress bar */
+  .progress-wrap {
+    display: none;
+    margin-top: 12px;
+  }
+
+  .progress-wrap.visible { display: block; }
+
+  .progress-label {
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 6px;
+    display: flex;
+    justify-content: space-between;
+  }
+
+  .progress-bar {
+    height: 4px;
+    background: var(--surface2);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  .progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    border-radius: 4px;
+    transition: width 0.4s;
+    width: 0%;
+  }
+
+  /* Anime list */
+  .anime-list { display: flex; flex-direction: column; gap: 6px; }
+
+  .anime-item {
+    padding: 10px 14px;
+    border-radius: 8px;
+    background: var(--surface2);
+    border: 1px solid transparent;
+    cursor: pointer;
+    font-size: 13px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    transition: all 0.15s;
+  }
+
+  .anime-item:hover, .anime-item.active {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .anime-item .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--success);
+    flex-shrink: 0;
+  }
+
+  /* Chat panel */
+  .chat-panel {
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 130px);
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+
+  .chat-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .chat-title {
+    font-family: 'Syne', sans-serif;
+    font-weight: 700;
+    font-size: 15px;
+  }
+
+  .anime-tag {
+    font-size: 11px;
+    background: rgba(124,106,255,0.15);
+    color: var(--accent);
+    padding: 4px 10px;
+    border-radius: 20px;
+    border: 1px solid rgba(124,106,255,0.3);
+  }
+
+  .chat-messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    scroll-behavior: smooth;
+  }
+
+  .chat-messages::-webkit-scrollbar { width: 4px; }
+  .chat-messages::-webkit-scrollbar-track { background: transparent; }
+  .chat-messages::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  /* Messages */
+  .msg {
+    display: flex;
+    flex-direction: column;
+    max-width: 85%;
+    animation: fadeUp 0.25s ease;
+  }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .msg.user { align-self: flex-end; align-items: flex-end; }
+  .msg.assistant { align-self: flex-start; }
+
+  .msg-bubble {
+    padding: 12px 16px;
+    border-radius: 12px;
+    font-size: 14px;
+    line-height: 1.6;
+  }
+
+  .msg.user .msg-bubble {
+    background: var(--accent);
+    color: white;
+    border-bottom-right-radius: 4px;
+  }
+
+  .msg.assistant .msg-bubble {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-bottom-left-radius: 4px;
+  }
+
+  .msg-meta {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 4px;
+    padding: 0 4px;
+  }
+
+  /* Source cards */
+  .sources {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+  }
+
+  .source-chip {
+    font-size: 11px;
+    padding: 4px 10px;
+    background: rgba(106,240,255,0.08);
+    border: 1px solid rgba(106,240,255,0.2);
+    color: var(--accent3);
+    border-radius: 20px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .source-chip:hover { background: rgba(106,240,255,0.15); }
+
+  /* Welcome screen */
+  .welcome {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    color: var(--muted);
+    text-align: center;
+    padding: 40px;
+  }
+
+  .welcome-icon { font-size: 48px; margin-bottom: 8px; }
+  .welcome h3 { font-family: 'Syne', sans-serif; font-size: 18px; color: var(--text); }
+  .welcome p { font-size: 13px; line-height: 1.8; max-width: 360px; }
+
+  /* Typing indicator */
+  .typing {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 12px 16px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    border-bottom-left-radius: 4px;
+    width: fit-content;
+  }
+
+  .typing-dot {
+    width: 6px; height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    animation: bounce 1.2s infinite;
+  }
+  .typing-dot:nth-child(2) { animation-delay: 0.2s; }
+  .typing-dot:nth-child(3) { animation-delay: 0.4s; }
+
+  @keyframes bounce {
+    0%, 60%, 100% { transform: translateY(0); }
+    30% { transform: translateY(-5px); }
+  }
+
+  /* Chat input */
+  .chat-input-area {
+    padding: 16px 20px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    gap: 10px;
+    align-items: flex-end;
+  }
+
+  .input-wrap {
+    flex: 1;
+    position: relative;
+  }
+
+  textarea {
+    width: 100%;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 11px 14px;
+    border-radius: 10px;
+    font-size: 14px;
+    font-family: 'Noto Sans KR', sans-serif;
+    outline: none;
+    resize: none;
+    line-height: 1.5;
+    min-height: 44px;
+    max-height: 120px;
+    transition: border-color 0.2s;
+  }
+
+  textarea:focus { border-color: var(--accent); }
+  textarea::placeholder { color: var(--muted); }
+
+  .send-btn {
+    width: 44px;
+    height: 44px;
+    border-radius: 10px;
+    background: var(--accent);
+    border: none;
+    color: white;
+    font-size: 18px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+    flex-shrink: 0;
+  }
+
+  .send-btn:hover { background: #6b59ee; transform: scale(1.05); }
+  .send-btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+
+  /* Toast */
+  .toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    padding: 12px 20px;
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 500;
+    z-index: 100;
+    animation: slideIn 0.3s ease;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .toast.success { background: rgba(74,222,128,0.15); border: 1px solid rgba(74,222,128,0.3); color: var(--success); }
+  .toast.error { background: rgba(248,113,113,0.15); border: 1px solid rgba(248,113,113,0.3); color: var(--error); }
+  .toast.info { background: rgba(124,106,255,0.15); border: 1px solid rgba(124,106,255,0.3); color: var(--accent); }
+
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateX(20px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
+
+  .empty-list {
+    font-size: 12px;
+    color: var(--muted);
+    text-align: center;
+    padding: 12px 0;
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="logo">Anime<span>Mind</span><em>.</em></div>
+    <div class="badge">RAG · Q&A</div>
+  </header>
+
+  <div class="main">
+    <!-- Sidebar -->
+    <div class="sidebar">
+
+      <!-- Upload panel -->
+      <div class="panel">
+        <div class="panel-header">🎬 영상 인덱싱</div>
+        <div class="panel-body">
+          <div class="form-group">
+            <label>애니메이션 제목</label>
+            <input type="text" id="animeTitle" placeholder="예: 원피스 EP1">
+          </div>
+
+          <div class="form-group">
+            <label>영상 파일</label>
+            <div class="upload-zone" id="videoZone">
+              <input type="file" id="videoFile" accept="video/*">
+              <div class="upload-icon">🎥</div>
+              <div class="upload-text"><strong>클릭</strong>하거나 드래그</div>
+              <div id="videoFileName" class="upload-text" style="margin-top:4px; font-size:11px;"></div>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>자막 추출 방법</label>
+            <select id="subtitleMethod">
+              <option value="whisper">🎙 Whisper STT (음성 인식)</option>
+              <option value="srt">📄 SRT 파일 사용</option>
+              <option value="ocr">👁 OCR (화면 자막)</option>
+            </select>
+          </div>
+
+          <div id="srtGroup" class="form-group" style="display:none;">
+            <label>SRT 자막 파일</label>
+            <div class="upload-zone" style="padding:12px;">
+              <input type="file" id="srtFile" accept=".srt">
+              <div class="upload-text"><strong>SRT 파일</strong> 선택</div>
+              <div id="srtFileName" class="upload-text" style="font-size:11px;"></div>
+            </div>
+          </div>
+
+          <div id="whisperGroup" class="form-group">
+            <label>Whisper 모델</label>
+            <select id="whisperModel">
+              <option value="tiny">tiny (빠름, 낮은 정확도)</option>
+              <option value="base" selected>base (권장)</option>
+              <option value="small">small (균형)</option>
+              <option value="medium">medium (느림, 높은 정확도)</option>
+            </select>
+          </div>
+
+          <div class="progress-wrap" id="progressWrap">
+            <div class="progress-label">
+              <span id="progressStep">처리 중...</span>
+              <span id="progressPct">0%</span>
+            </div>
+            <div class="progress-bar">
+              <div class="progress-fill" id="progressFill"></div>
+            </div>
+          </div>
+
+          <button class="btn btn-primary" id="indexBtn" onclick="startIndex()">
+            ⚡ 인덱싱 시작
+          </button>
+        </div>
+      </div>
+
+      <!-- Anime list panel -->
+      <div class="panel">
+        <div class="panel-header">📚 등록된 애니메이션</div>
+        <div class="panel-body">
+          <div class="anime-list" id="animeList">
+            <div class="empty-list">인덱싱된 애니메이션이 없습니다</div>
+          </div>
+          <div style="margin-top:12px;">
+            <button class="btn btn-ghost" onclick="loadAnimes()" style="font-size:12px; padding:8px;">
+              🔄 새로고침
+            </button>
+          </div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Chat panel -->
+    <div class="chat-panel">
+      <div class="chat-header">
+        <div class="chat-title">Q&A 어시스턴트</div>
+        <div class="anime-tag" id="selectedAnimeTag">애니메이션을 선택하세요</div>
+      </div>
+
+      <div class="chat-messages" id="chatMessages">
+        <div class="welcome">
+          <div class="welcome-icon">🌸</div>
+          <h3>AnimeMind에 오신 걸 환영합니다</h3>
+          <p>좌측에서 영상을 인덱싱하거나<br>등록된 애니메이션을 선택하고<br>자유롭게 질문해보세요!</p>
+        </div>
+      </div>
+
+      <div class="chat-input-area">
+        <div class="input-wrap">
+          <textarea id="questionInput"
+            placeholder="질문을 입력하세요... (예: 루피가 기어 2를 처음 쓴 장면은 몇 분이야?)"
+            rows="1"
+            onkeydown="handleKey(event)"
+            oninput="autoResize(this)"></textarea>
+        </div>
+        <button class="send-btn" id="sendBtn" onclick="sendQuestion()" title="전송">
+          ➤
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = 'http://localhost:8000';
+let selectedAnime = null;
+let chatHistory = [];
+let pollingInterval = null;
+
+// ──────────────────────────────────────────────
+// 초기화
+// ──────────────────────────────────────────────
+
+window.onload = () => {
+  loadAnimes();
+
+  document.getElementById('subtitleMethod').addEventListener('change', (e) => {
+    document.getElementById('srtGroup').style.display = e.target.value === 'srt' ? 'block' : 'none';
+    document.getElementById('whisperGroup').style.display = e.target.value === 'whisper' ? 'block' : 'none';
+  });
+
+  document.getElementById('videoFile').addEventListener('change', (e) => {
+    const name = e.target.files[0]?.name || '';
+    document.getElementById('videoFileName').textContent = name;
+  });
+
+  document.getElementById('srtFile').addEventListener('change', (e) => {
+    const name = e.target.files[0]?.name || '';
+    document.getElementById('srtFileName').textContent = name;
+  });
+};
+
+// ──────────────────────────────────────────────
+// 인덱싱
+// ──────────────────────────────────────────────
+
+async function startIndex() {
+  const title = document.getElementById('animeTitle').value.trim();
+  const videoFile = document.getElementById('videoFile').files[0];
+  const method = document.getElementById('subtitleMethod').value;
+
+  if (!title) return showToast('애니메이션 제목을 입력하세요', 'error');
+  if (!videoFile) return showToast('영상 파일을 선택하세요', 'error');
+
+  const formData = new FormData();
+  formData.append('video', videoFile);
+  formData.append('anime_title', title);
+  formData.append('subtitle_method', method);
+  formData.append('whisper_model', document.getElementById('whisperModel').value);
+  formData.append('frame_interval', '2.0');
+  formData.append('chapter_duration', '60.0');
+
+  if (method === 'srt') {
+    const srtFile = document.getElementById('srtFile').files[0];
+    if (!srtFile) return showToast('SRT 파일을 선택하세요', 'error');
+    formData.append('subtitle', srtFile);
+  }
+
+  document.getElementById('indexBtn').disabled = true;
+  document.getElementById('progressWrap').classList.add('visible');
+
+  try {
+    const res = await fetch(`${API}/index`, { method: 'POST', body: formData });
+    const data = await res.json();
+    showToast(`인덱싱 시작됨: ${title}`, 'info');
+    startPolling(title);
+  } catch(e) {
+    showToast('서버 연결 실패. API 서버가 실행 중인지 확인하세요.', 'error');
+    document.getElementById('indexBtn').disabled = false;
+    document.getElementById('progressWrap').classList.remove('visible');
+  }
+}
+
+function startPolling(title) {
+  if (pollingInterval) clearInterval(pollingInterval);
+  pollingInterval = setInterval(async () => {
+    try {
+      const res = await fetch(`${API}/index/status/${encodeURIComponent(title)}`);
+      const data = await res.json();
+
+      document.getElementById('progressStep').textContent = data.step;
+      document.getElementById('progressPct').textContent = `${data.progress}%`;
+      document.getElementById('progressFill').style.width = `${Math.max(0, data.progress)}%`;
+
+      if (data.status === 'done') {
+        clearInterval(pollingInterval);
+        document.getElementById('indexBtn').disabled = false;
+        showToast(`✅ 인덱싱 완료! ${data.chapter_count}개 챕터`, 'success');
+        loadAnimes();
+      } else if (data.status === 'error') {
+        clearInterval(pollingInterval);
+        document.getElementById('indexBtn').disabled = false;
+        showToast(`오류: ${data.step}`, 'error');
+      }
+    } catch(e) {}
+  }, 2000);
+}
+
+// ──────────────────────────────────────────────
+// 애니메이션 목록
+// ──────────────────────────────────────────────
+
+async function loadAnimes() {
+  try {
+    const res = await fetch(`${API}/animes`);
+    const data = await res.json();
+    renderAnimeList(data.animes);
+  } catch(e) {
+    document.getElementById('animeList').innerHTML = '<div class="empty-list">서버에 연결할 수 없습니다</div>';
+  }
+}
+
+function renderAnimeList(animes) {
+  const el = document.getElementById('animeList');
+  if (!animes.length) {
+    el.innerHTML = '<div class="empty-list">인덱싱된 애니메이션이 없습니다</div>';
+    return;
+  }
+  el.innerHTML = animes.map(a => `
+    <div class="anime-item ${selectedAnime === a ? 'active' : ''}" onclick="selectAnime('${a}')">
+      <div class="dot"></div>
+      ${a}
+    </div>
+  `).join('');
+}
+
+function selectAnime(title) {
+  selectedAnime = title;
+  chatHistory = [];
+  document.getElementById('selectedAnimeTag').textContent = title;
+  document.getElementById('chatMessages').innerHTML = `
+    <div class="welcome">
+      <div class="welcome-icon">🎌</div>
+      <h3>${title}</h3>
+      <p>이 애니메이션에 대해 무엇이든 물어보세요!</p>
+    </div>
+  `;
+  loadAnimes();
+  showToast(`${title} 선택됨`, 'info');
+}
+
+// ──────────────────────────────────────────────
+// Q&A
+// ──────────────────────────────────────────────
+
+async function sendQuestion() {
+  const input = document.getElementById('questionInput');
+  const question = input.value.trim();
+
+  if (!question) return;
+  if (!selectedAnime) return showToast('먼저 애니메이션을 선택하세요', 'error');
+
+  input.value = '';
+  input.style.height = 'auto';
+  document.getElementById('sendBtn').disabled = true;
+
+  appendMessage('user', question);
+
+  const typingEl = appendTyping();
+
+  try {
+    const res = await fetch(`${API}/ask`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        question,
+        anime_title: selectedAnime,
+        chat_history: chatHistory
+      })
+    });
+
+    const data = await res.json();
+    typingEl.remove();
+
+    appendMessage('assistant', data.answer, data.sources, data.timestamps);
+
+    chatHistory.push({ role: 'user', content: question });
+    chatHistory.push({ role: 'assistant', content: data.answer });
+
+    if (chatHistory.length > 20) chatHistory = chatHistory.slice(-20);
+
+  } catch(e) {
+    typingEl.remove();
+    appendMessage('assistant', '❌ 서버 연결에 실패했습니다. API 서버가 실행 중인지 확인하세요.');
+  }
+
+  document.getElementById('sendBtn').disabled = false;
+}
+
+function appendMessage(role, text, sources = [], timestamps = []) {
+  const container = document.getElementById('chatMessages');
+
+  // 웰컴 메시지 제거
+  const welcome = container.querySelector('.welcome');
+  if (welcome) welcome.remove();
+
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+
+  let sourcesHTML = '';
+  if (sources && sources.length) {
+    sourcesHTML = `<div class="sources">
+      ${sources.map(s => `
+        <div class="source-chip" title="유사도: ${s.score}">
+          ⏱ ${s.start_time} ~ ${s.end_time}
+        </div>
+      `).join('')}
+    </div>`;
+  }
+
+  div.innerHTML = `
+    <div class="msg-bubble">${escapeHtml(text).replace(/\n/g, '<br>')}</div>
+    ${sourcesHTML}
+    <div class="msg-meta">${role === 'user' ? '나' : '🤖 AnimeMind'}</div>
+  `;
+
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+  return div;
+}
+
+function appendTyping() {
+  const container = document.getElementById('chatMessages');
+  const div = document.createElement('div');
+  div.className = 'msg assistant';
+  div.innerHTML = `<div class="typing"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div>`;
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+  return div;
+}
+
+function handleKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendQuestion();
+  }
+}
+
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ──────────────────────────────────────────────
+// Toast
+// ──────────────────────────────────────────────
+
+function showToast(msg, type = 'info') {
+  const existing = document.querySelector('.toast');
+  if (existing) existing.remove();
+
+  const icons = { success: '✅', error: '❌', info: 'ℹ️' };
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.innerHTML = `${icons[type]} ${msg}`;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+</script>
+</body>
+</html>

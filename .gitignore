@@ -1,48 +1,22 @@
-# Ignore everything by default.
-*
+# Secrets and local environment.
+.env
+.env.*
+*.pem
+*.key
+*secret*
+*token*
 
-# Keep folders visible so allowed files inside them can be tracked.
-!*/
-
-# Git/project essentials.
-!.gitignore
-!README.md
-!requirements.txt
-
-# Source code and frontend files.
-!*.py
-!*.html
-!*.css
-!*.js
-!*.ts
-!*.tsx
-!*.jsx
-!*.json
-!*.toml
-!*.yaml
-!*.yml
-
-# Always ignore generated/runtime artifacts.
+# Python runtime artifacts.
 __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
 .Python
-
-# Virtual environments and local config.
-.env
-.env.*
 venv/
 .venv/
 env/
 
-# OS/editor files.
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
-
-# Data, databases, model outputs, and media.
+# Generated app data and local databases.
 chroma_db/
 *.db
 *.sqlite
@@ -51,17 +25,14 @@ chroma_db/
 *.pickle
 *.npy
 *.npz
-*.pt
-*.pth
-*.onnx
+
+# Large media and binary assets.
 *.mp4
 *.mov
 *.avi
 *.mkv
 *.mp3
 *.wav
-*.srt
-*.vtt
 *.png
 *.jpg
 *.jpeg
@@ -72,8 +43,17 @@ chroma_db/
 *.tar
 *.gz
 
-# User uploads/submissions and logs.
-submissions/
-uploads/
+# Logs and local outputs.
 logs/
+uploads/
+submissions/
 *.log
+
+# OS/editor files.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local repository metadata backups.
+.repo-backups/

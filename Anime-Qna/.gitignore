@@ -1,0 +1,79 @@
+# Ignore everything by default.
+*
+
+# Keep folders visible so allowed files inside them can be tracked.
+!*/
+
+# Git/project essentials.
+!.gitignore
+!README.md
+!requirements.txt
+
+# Source code and frontend files.
+!*.py
+!*.html
+!*.css
+!*.js
+!*.ts
+!*.tsx
+!*.jsx
+!*.json
+!*.toml
+!*.yaml
+!*.yml
+
+# Always ignore generated/runtime artifacts.
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments and local config.
+.env
+.env.*
+venv/
+.venv/
+env/
+
+# OS/editor files.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Data, databases, model outputs, and media.
+chroma_db/
+*.db
+*.sqlite
+*.sqlite3
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.pt
+*.pth
+*.onnx
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.mp3
+*.wav
+*.srt
+*.vtt
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.pdf
+*.zip
+*.tar
+*.gz
+
+# User uploads/submissions and logs.
+submissions/
+uploads/
+logs/
+*.log

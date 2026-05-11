@@ -21,6 +21,14 @@ cp .env.example .env
 ```
 
 Edit `.env` and set `HF_TOKEN`. The same token is used for VLM, LLM, and embedding API calls.
+If Hugging Face auto-routing sends a model to a provider where it is not serverless,
+set a step-specific provider, for example:
+
+```env
+HF_VLM_PROVIDER=hf-inference
+HF_LLM_PROVIDER=hf-inference
+HF_EMBEDDING_PROVIDER=hf-inference
+```
 
 TransNetV2 also needs the system `ffmpeg` executable:
 
@@ -48,6 +56,12 @@ python pipeline.py index \
   --transnet-weights /path/to/transnetv2-pytorch-weights.pth \
   --proxy-width 320 \
   --candidate-stride 0.5
+```
+
+Indexing writes a timing report to each run directory:
+
+```text
+data/runs/<run_id>/timings.json
 ```
 
 If `--transnet-weights` is omitted, the pipeline checks `TRANSNET_WEIGHTS`,

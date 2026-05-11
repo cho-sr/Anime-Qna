@@ -93,6 +93,8 @@ class HybridRAGEngine:
         llm_model: str,
         embedding_model: str,
         hf_provider: str | None = None,
+        llm_provider: str | None = None,
+        embedding_provider: str | None = None,
     ):
         if not hf_token:
             raise RuntimeError("HF_TOKEN is required for RAG query expansion, embedding, and answers.")
@@ -101,16 +103,19 @@ class HybridRAGEngine:
         self.embedder = QwenSummaryEmbedder(
             model_name=embedding_model,
             token=hf_token,
-            provider=hf_provider,
+            provider=embedding_provider or hf_provider,
         )
-        self.llm = RAGLLMClient(token=hf_token, model=llm_model, provider=hf_provider)
+        self.llm = RAGLLMClient(token=hf_token, model=llm_model, provider=llm_provider or hf_provider)
 
     @classmethod
     def from_env(cls, qdrant_path: str | Path) -> "HybridRAGEngine":
+        hf_provider = os.getenv("HF_PROVIDER") or None
         return cls(
             qdrant_path=qdrant_path,
             hf_token=os.getenv("HF_TOKEN", ""),
-            hf_provider=os.getenv("HF_PROVIDER") or None,
+            hf_provider=hf_provider,
+            llm_provider=os.getenv("HF_LLM_PROVIDER") or hf_provider,
+            embedding_provider=os.getenv("HF_EMBEDDING_PROVIDER") or hf_provider,
             llm_model=os.getenv("HF_LLM_MODEL", "Qwen/Qwen3-8B"),
             embedding_model=os.getenv("HF_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B"),
         )
@@ -286,4 +291,3 @@ class HybridRAGEngine:
                 seen.add(point_id)
                 scores[point_id] = scores.get(point_id, 0.0) + 1.0 / (k + rank)
         return scores
-

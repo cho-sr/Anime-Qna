@@ -46,12 +46,15 @@ class HuggingFaceChatClient:
         messages: list[dict[str, Any]],
         max_tokens: int = 800,
     ) -> dict[str, Any]:
-        response = self.client.chat_completion(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=0.0,
-        )
+        try:
+            response = self.client.chat_completion(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.0,
+            )
+        except Exception as exc:
+            raise RuntimeError(self._format_hf_error(model, exc)) from exc
         content = _message_content(response)
         try:
             return extract_json_object(content)
@@ -65,13 +68,29 @@ class HuggingFaceChatClient:
         max_tokens: int = 1000,
         temperature: float = 0.2,
     ) -> str:
-        response = self.client.chat_completion(
-            model=model,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+        try:
+            response = self.client.chat_completion(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        except Exception as exc:
+            raise RuntimeError(self._format_hf_error(model, exc)) from exc
         return _message_content(response).strip()
+
+    @staticmethod
+    def _format_hf_error(model: str, exc: Exception) -> str:
+        message = str(exc)
+        hint = ""
+        if "non-serverless model" in message or "model_not_available" in message:
+            hint = (
+                "\nHint: this model is not available through the selected Hugging Face "
+                "serverless provider. Set HF_VLM_PROVIDER/HF_LLM_PROVIDER to another "
+                "provider such as hf-inference, use a serverless-supported model, or "
+                "create a dedicated endpoint for the model."
+            )
+        return f"Hugging Face request failed for model '{model}': {message}{hint}"
 
 
 class VideoVLMClient:

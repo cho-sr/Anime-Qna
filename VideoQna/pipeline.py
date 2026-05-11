@@ -74,7 +74,11 @@ def cmd_index(args: argparse.Namespace) -> None:
 
     vlm = VideoVLMClient(token=hf_token, model=vlm_model, provider=hf_provider)
     llm = SummaryLLMClient(token=hf_token, model=llm_model, provider=hf_provider)
-    embedder = QwenSummaryEmbedder(model_name=embedding_model)
+    embedder = QwenSummaryEmbedder(
+        model_name=embedding_model,
+        token=hf_token,
+        provider=hf_provider,
+    )
     store = QdrantSummaryStore(qdrant_path=qdrant_path)
 
     records = []

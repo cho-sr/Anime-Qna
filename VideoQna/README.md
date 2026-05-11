@@ -5,9 +5,9 @@ VideoQna indexes a local video into Qdrant using this flow:
 1. Extract full-video subtitles with Whisper.
 2. Create a low-resolution proxy video and split shots with TransNetV2.
 3. Select one representative keyframe per shot using K-Means with `k=1`.
-4. Send only the keyframe image to a Hugging Face Qwen VLM.
-5. Send the VLM frame description plus the full shot subtitles to a Qwen LLM.
-6. Embed only the LLM `summary` with Qwen3 Embedding.
+4. Send only the keyframe image to a Hugging Face Qwen VLM API.
+5. Send the VLM frame description plus the full shot subtitles to a Qwen LLM API.
+6. Embed only the LLM `summary` with a Qwen3 Embedding API.
 7. Store the vector and JSON metadata in local persistent Qdrant.
 
 ## Setup
@@ -20,7 +20,15 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` and set `HF_TOKEN`.
+Edit `.env` and set `HF_TOKEN`. The same token is used for VLM, LLM, and embedding API calls.
+
+TransNetV2 also needs the system `ffmpeg` executable:
+
+```bash
+conda install -c conda-forge ffmpeg
+# or, if you use Homebrew
+brew install ffmpeg
+```
 
 ## Index
 
@@ -51,6 +59,42 @@ inside the installed `transnetv2_pytorch` package.
 ```bash
 python pipeline.py stats --collection video_qna
 ```
+
+## RAG API
+
+Run the server from the `VideoQna` directory:
+
+```bash
+uvicorn api_server:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Open the UI:
+
+```text
+http://localhost:8000/
+```
+
+Ask a question:
+
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "주인공이 놀라거나 당황하는 장면은?",
+    "collection": "video_qna",
+    "top_k": 5,
+    "dense_top_k": 20,
+    "bm25_top_k": 20
+  }'
+```
+
+The server performs:
+
+1. Qwen LLM query expansion.
+2. Dense retrieval with Qwen3 embedding API against Qdrant vectors.
+3. Contextual BM25 over stored JSON payload fields.
+4. RRF fusion of dense and BM25 rankings.
+5. Qwen LLM answer generation with timestamped sources.
 
 ## Stored Payload
 

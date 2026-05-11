@@ -41,7 +41,7 @@ class QdrantSummaryStore:
         return point_id
 
     def collection_stats(self, collection: str) -> dict[str, Any]:
-        if not self._collection_exists(collection):
+        if not self.collection_exists(collection):
             return {
                 "collection": collection,
                 "exists": False,
@@ -56,13 +56,83 @@ class QdrantSummaryStore:
             "points_count": count,
         }
 
+    def collection_exists(self, collection: str) -> bool:
+        return self._collection_exists(collection)
+
+    def dense_search(
+        self,
+        collection: str,
+        vector: list[float],
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        if not self.collection_exists(collection):
+            return []
+
+        if hasattr(self.client, "query_points"):
+            response = self.client.query_points(
+                collection_name=collection,
+                query=vector,
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+            )
+            points = getattr(response, "points", response)
+        else:
+            points = self.client.search(
+                collection_name=collection,
+                query_vector=vector,
+                limit=limit,
+                with_payload=True,
+                with_vectors=False,
+            )
+
+        results = []
+        for point in points:
+            results.append(
+                {
+                    "id": str(point.id),
+                    "score": float(getattr(point, "score", 0.0) or 0.0),
+                    "payload": dict(getattr(point, "payload", {}) or {}),
+                }
+            )
+        return results
+
+    def scroll_payloads(
+        self,
+        collection: str,
+        batch_size: int = 256,
+    ) -> list[dict[str, Any]]:
+        if not self.collection_exists(collection):
+            return []
+
+        records: list[dict[str, Any]] = []
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=collection,
+                limit=batch_size,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for point in points:
+                records.append(
+                    {
+                        "id": str(point.id),
+                        "payload": dict(getattr(point, "payload", {}) or {}),
+                    }
+                )
+            if offset is None:
+                break
+        return records
+
     def _ensure_collection(self, collection: str, vector_size: int) -> None:
         try:
             from qdrant_client.models import Distance, VectorParams
         except ImportError as exc:
             raise RuntimeError("qdrant-client models are unavailable.") from exc
 
-        if not self._collection_exists(collection):
+        if not self.collection_exists(collection):
             self.client.create_collection(
                 collection_name=collection,
                 vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
@@ -95,4 +165,3 @@ class QdrantSummaryStore:
             if first and hasattr(first, "size"):
                 return int(first.size)
         return None
-

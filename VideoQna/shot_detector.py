@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
 import cv2
@@ -98,6 +99,7 @@ class TransNetShotDetector:
     def detect(self, video_path: str | Path, work_dir: str | Path) -> list[Shot]:
         video_path = Path(video_path)
         work_dir = Path(work_dir)
+        self._ensure_ffmpeg()
         info = get_video_info(video_path)
         proxy_path = work_dir / f"{video_path.stem}_transnet_proxy.mp4"
         create_lowres_proxy(video_path, proxy_path, self.proxy_width)
@@ -135,6 +137,18 @@ class TransNetShotDetector:
 
         print(f"[transnet] done: {len(shots)} shots")
         return shots
+
+    @staticmethod
+    def _ensure_ffmpeg() -> None:
+        if shutil.which("ffmpeg"):
+            return
+        raise RuntimeError(
+            "ffmpeg executable was not found. TransNetV2 requires the system ffmpeg command. "
+            "Install it with one of:\n"
+            "  conda install -c conda-forge ffmpeg\n"
+            "  brew install ffmpeg\n"
+            "Then restart the terminal and run the indexing command again."
+        )
 
     def _load_weights_if_available(self, model) -> None:
         weights_path = self.weights_path or self._find_weights_path()

@@ -58,6 +58,21 @@ class HuggingFaceChatClient:
         except Exception as exc:
             raise RuntimeError(f"Model did not return valid JSON: {content[:500]}") from exc
 
+    def chat_text(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        max_tokens: int = 1000,
+        temperature: float = 0.2,
+    ) -> str:
+        response = self.client.chat_completion(
+            model=model,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return _message_content(response).strip()
+
 
 class VideoVLMClient:
     def __init__(self, token: str, model: str, provider: Optional[str] = None):
@@ -148,3 +163,73 @@ class SummaryLLMClient:
             emotion=ensure_str_list(data.get("emotion")),
         )
 
+
+class RAGLLMClient:
+    def __init__(self, token: str, model: str, provider: Optional[str] = None):
+        self.model = model
+        self.chat = HuggingFaceChatClient(token=token, provider=provider)
+
+    def expand_query(self, question: str) -> dict[str, Any]:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You expand Korean video search questions. Return only JSON."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Create search expansions for this video RAG question. "
+                    "Return JSON fields exactly as: expanded_queries (array of up to 3 Korean strings), "
+                    "keywords (array of Korean or English terms). "
+                    "Keep expansions faithful to the question.\n\n"
+                    f"QUESTION: {question}"
+                ),
+            },
+        ]
+        data = self.chat.chat_json(self.model, messages, max_tokens=500)
+        expanded = ensure_str_list(data.get("expanded_queries"))[:3]
+        keywords = ensure_str_list(data.get("keywords"))[:12]
+        return {"expanded_queries": expanded, "keywords": keywords}
+
+    def answer_question(self, question: str, sources: list[dict[str, Any]]) -> str:
+        if not sources:
+            return "저장된 영상 정보에서 질문과 관련된 내용을 찾기 어렵습니다."
+
+        context = []
+        for source in sources:
+            context.append(
+                {
+                    "rank": source.get("rank"),
+                    "shot_id": source.get("shot_id"),
+                    "timestamp": source.get("timestamp"),
+                    "summary": source.get("summary"),
+                    "action": source.get("action"),
+                    "context": source.get("context"),
+                    "emotion": source.get("emotion"),
+                    "frame_description": source.get("frame_description"),
+                    "subtitles": source.get("subtitles"),
+                }
+            )
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You answer questions about an indexed video. "
+                    "Use only the provided retrieved shot context. "
+                    "Answer in Korean. Mention relevant timestamps when useful. "
+                    "If the context is insufficient, say that the stored video information "
+                    "does not contain enough evidence."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"QUESTION:\n{question}\n\n"
+                    f"RETRIEVED_CONTEXT_JSON:\n{json.dumps(context, ensure_ascii=False)}"
+                ),
+            },
+        ]
+        return self.chat.chat_text(self.model, messages, max_tokens=1100, temperature=0.2)

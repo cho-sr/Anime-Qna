@@ -117,7 +117,10 @@ class HybridRAGEngine:
             llm_provider=os.getenv("HF_LLM_PROVIDER") or hf_provider,
             embedding_provider=os.getenv("HF_EMBEDDING_PROVIDER") or hf_provider,
             llm_model=os.getenv("HF_LLM_MODEL", "Qwen/Qwen3-8B"),
-            embedding_model=os.getenv("HF_EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B"),
+            embedding_model=os.getenv(
+                "HF_EMBEDDING_MODEL",
+                "ibm-granite/granite-embedding-97m-multilingual-r2",
+            ),
         )
 
     def ask(self, question: str, collection: str, config: RetrievalConfig) -> dict[str, Any]:

@@ -5,9 +5,9 @@ VideoQna indexes a local video into Qdrant using this flow:
 1. Extract full-video subtitles with Whisper.
 2. Create a low-resolution proxy video and split shots with TransNetV2.
 3. Select one representative keyframe per shot using K-Means with `k=1`.
-4. Send only the keyframe image to a Hugging Face Qwen VLM API.
+4. Send only the keyframe image to a Hugging Face Router Qwen VLM API.
 5. Send the VLM frame description plus the full shot subtitles to a Qwen LLM API.
-6. Embed only the LLM `summary` with a Qwen3 Embedding API.
+6. Embed only the LLM `summary` with a Hugging Face feature-extraction API.
 7. Store the vector and JSON metadata in local persistent Qdrant.
 
 ## Setup
@@ -21,13 +21,24 @@ cp .env.example .env
 ```
 
 Edit `.env` and set `HF_TOKEN`. The same token is used for VLM, LLM, and embedding API calls.
-If Hugging Face auto-routing sends a model to a provider where it is not serverless,
-set a step-specific provider, for example:
+Chat/VLM calls use the Hugging Face Router's OpenAI-compatible API. You can
+pin a provider either in the model id or with a provider variable:
 
 ```env
-HF_VLM_PROVIDER=hf-inference
-HF_LLM_PROVIDER=hf-inference
-HF_EMBEDDING_PROVIDER=hf-inference
+HF_VLM_MODEL=Qwen/Qwen3.5-9B:together
+# or:
+HF_VLM_MODEL=Qwen/Qwen3.5-9B
+HF_VLM_PROVIDER=together
+```
+
+Embedding calls use Hugging Face feature extraction through `huggingface_hub`.
+The default `.env.example` uses an `hf-inference` multilingual embedding model.
+If you want to keep Qwen3 embeddings, use a provider/model pair that supports
+feature extraction, for example:
+
+```env
+HF_EMBEDDING_PROVIDER=scaleway
+HF_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-8B
 ```
 
 TransNetV2 also needs the system `ffmpeg` executable:
@@ -105,7 +116,7 @@ curl -X POST http://localhost:8000/ask \
 The server performs:
 
 1. Qwen LLM query expansion.
-2. Dense retrieval with Qwen3 embedding API against Qdrant vectors.
+2. Dense retrieval with the configured embedding API against Qdrant vectors.
 3. Contextual BM25 over stored JSON payload fields.
 4. RRF fusion of dense and BM25 rankings.
 5. Qwen LLM answer generation with timestamped sources.

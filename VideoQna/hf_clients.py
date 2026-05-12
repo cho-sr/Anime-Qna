@@ -9,14 +9,67 @@ from models import FrameDescription, SceneSummary, SubtitleSegment
 from utils import ensure_str, ensure_str_list, extract_json_object
 
 
+JSON_RETRY_PROMPT = (
+    "Your previous response was empty or invalid. Return exactly one valid JSON "
+    "object and nothing else. Do not include markdown, comments, or reasoning. /no_think"
+)
+
+
+def _content_to_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text") or item.get("content")
+                if text:
+                    parts.append(str(text))
+            elif item is not None:
+                parts.append(str(item))
+        return "\n".join(parts)
+    return str(content)
+
+
 def _message_content(response: Any) -> str:
     try:
-        return response.choices[0].message.content
-    except AttributeError:
+        return _content_to_text(response.choices[0].message.content)
+    except (AttributeError, IndexError, TypeError):
         pass
     if isinstance(response, dict):
-        return response["choices"][0]["message"]["content"]
-    return str(response)
+        message = response.get("choices", [{}])[0].get("message", {})
+        if isinstance(message, dict):
+            return _content_to_text(message.get("content"))
+        return _content_to_text(getattr(message, "content", ""))
+    return _content_to_text(response)
+
+
+def _json_retry_messages(
+    messages: list[dict[str, Any]],
+    invalid_content: str,
+) -> list[dict[str, Any]]:
+    retry_messages = list(messages)
+    invalid_content = invalid_content.strip()
+    if invalid_content:
+        retry_messages.append({"role": "assistant", "content": invalid_content[:2000]})
+    retry_messages.append({"role": "user", "content": JSON_RETRY_PROMPT})
+    return retry_messages
+
+
+def _content_preview(content: str, limit: int = 500) -> str:
+    preview = content.strip()
+    if not preview:
+        return "<empty response>"
+    return preview[:limit]
+
+
+def _clip_text(text: str, max_chars: int) -> str:
+    text = " ".join(text.split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
 
 
 class HuggingFaceChatClient:
@@ -29,16 +82,19 @@ class HuggingFaceChatClient:
         if not token:
             raise RuntimeError("HF_TOKEN is required for Hugging Face model calls.")
         try:
-            from huggingface_hub import InferenceClient
+            from openai import OpenAI
         except ImportError as exc:
             raise RuntimeError(
-                "huggingface-hub is required. Install VideoQna/requirements.txt first."
+                "openai is required for Hugging Face Router chat calls. "
+                "Install VideoQna/requirements.txt first."
             ) from exc
 
-        kwargs: dict[str, Any] = {"token": token, "timeout": timeout}
-        if provider:
-            kwargs["provider"] = provider
-        self.client = InferenceClient(**kwargs)
+        self.provider = provider
+        self.client = OpenAI(
+            base_url="https://router.huggingface.co/v1",
+            api_key=token,
+            timeout=timeout,
+        )
 
     def chat_json(
         self,
@@ -46,20 +102,36 @@ class HuggingFaceChatClient:
         messages: list[dict[str, Any]],
         max_tokens: int = 800,
     ) -> dict[str, Any]:
-        try:
-            response = self.client.chat_completion(
-                model=model,
-                messages=messages,
-                max_tokens=max_tokens,
-                temperature=0.0,
-            )
-        except Exception as exc:
-            raise RuntimeError(self._format_hf_error(model, exc)) from exc
-        content = _message_content(response)
-        try:
-            return extract_json_object(content)
-        except Exception as exc:
-            raise RuntimeError(f"Model did not return valid JSON: {content[:500]}") from exc
+        active_messages = messages
+        content = ""
+        parse_error: Exception | None = None
+
+        for attempt in range(2):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self._router_model(model),
+                    messages=active_messages,
+                    max_tokens=max_tokens,
+                    temperature=0.0,
+                )
+            except Exception as exc:
+                raise RuntimeError(self._format_hf_error(model, exc)) from exc
+
+            content = _message_content(response)
+            if not content.strip():
+                parse_error = ValueError("Model response was empty.")
+            else:
+                try:
+                    return extract_json_object(content)
+                except Exception as exc:
+                    parse_error = exc
+
+            if attempt == 0:
+                active_messages = _json_retry_messages(messages, content)
+
+        raise RuntimeError(
+            f"Model did not return valid JSON: {_content_preview(content)}"
+        ) from parse_error
 
     def chat_text(
         self,
@@ -69,8 +141,8 @@ class HuggingFaceChatClient:
         temperature: float = 0.2,
     ) -> str:
         try:
-            response = self.client.chat_completion(
-                model=model,
+            response = self.client.chat.completions.create(
+                model=self._router_model(model),
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
@@ -78,6 +150,11 @@ class HuggingFaceChatClient:
         except Exception as exc:
             raise RuntimeError(self._format_hf_error(model, exc)) from exc
         return _message_content(response).strip()
+
+    def _router_model(self, model: str) -> str:
+        if ":" in model or not self.provider:
+            return model
+        return f"{model}:{self.provider}"
 
     @staticmethod
     def _format_hf_error(model: str, exc: Exception) -> str:
@@ -104,7 +181,8 @@ class VideoVLMClient:
             {
                 "role": "system",
                 "content": (
-                    "You describe a single video keyframe. Return only JSON in Korean."
+                    "You describe a single video keyframe. Return only JSON in Korean. "
+                    "Do not include reasoning."
                 ),
             },
             {
@@ -120,13 +198,26 @@ class VideoVLMClient:
                             "Describe only what is visible in this keyframe. "
                             "Do not infer dialogue or unseen context. "
                             "Return JSON with fields: frame_description, "
-                            "visible_objects, visible_actions."
+                            "visible_objects, visible_actions. "
+                            "Return exactly one JSON object and no markdown. /no_think"
                         ),
                     },
                 ],
             },
         ]
-        data = self.chat.chat_json(self.model, messages, max_tokens=700)
+        try:
+            data = self.chat.chat_json(self.model, messages, max_tokens=700)
+        except RuntimeError as exc:
+            if "Model did not return valid JSON" not in str(exc):
+                raise
+            reason = str(exc).splitlines()[0]
+            print(f"[warn] VLM keyframe JSON failed; using fallback description: {reason}")
+            return FrameDescription(
+                frame_description="키프레임 이미지 설명을 생성하지 못했습니다.",
+                visible_objects=[],
+                visible_actions=[],
+            )
+
         return FrameDescription(
             frame_description=ensure_str(
                 data.get("frame_description") or data.get("description")
@@ -162,6 +253,7 @@ class SummaryLLMClient:
                 "content": (
                     "You summarize a video shot using a visual description and "
                     "the full subtitles overlapping that shot. Return only JSON in Korean."
+                    " Do not include reasoning."
                 ),
             },
             {
@@ -170,16 +262,60 @@ class SummaryLLMClient:
                     "Create a concise searchable scene summary. "
                     "Return JSON fields exactly as: summary (string), "
                     "action (array of strings), context (string), emotion (array of strings).\n\n"
+                    "Return exactly one JSON object and no markdown. /no_think\n\n"
                     f"INPUT_JSON:\n{json.dumps(payload, ensure_ascii=False)}"
                 ),
             },
         ]
-        data = self.chat.chat_json(self.model, messages, max_tokens=900)
-        return SceneSummary(
+        try:
+            data = self.chat.chat_json(self.model, messages, max_tokens=900)
+        except RuntimeError as exc:
+            if "Model did not return valid JSON" not in str(exc):
+                raise
+            reason = str(exc).splitlines()[0]
+            print(f"[warn] LLM summary JSON failed; using fallback summary: {reason}")
+            return self.fallback_summary(frame_description, shot_subtitles)
+
+        summary = SceneSummary(
             summary=ensure_str(data.get("summary")),
             action=ensure_str_list(data.get("action")),
             context=ensure_str(data.get("context")),
             emotion=ensure_str_list(data.get("emotion")),
+        )
+        if not summary.summary:
+            print("[warn] LLM summary JSON omitted summary; using fallback summary.")
+            return self.fallback_summary(frame_description, shot_subtitles)
+        return summary
+
+    @staticmethod
+    def fallback_summary(
+        frame_description: FrameDescription,
+        shot_subtitles: list[SubtitleSegment],
+    ) -> SceneSummary:
+        visual = ensure_str(frame_description.frame_description)
+        subtitle_texts = [ensure_str(segment.text) for segment in shot_subtitles]
+        subtitle_text = " ".join(text for text in subtitle_texts if text)
+
+        if visual and subtitle_text:
+            summary = f"{visual} 자막 내용: {subtitle_text}"
+        elif subtitle_text:
+            summary = subtitle_text
+        elif visual:
+            summary = visual
+        else:
+            summary = "장면 요약을 생성할 수 있는 화면 설명이나 자막이 부족합니다."
+
+        context_parts = []
+        if visual:
+            context_parts.append(f"화면: {visual}")
+        if subtitle_text:
+            context_parts.append(f"자막: {subtitle_text}")
+
+        return SceneSummary(
+            summary=_clip_text(summary, 700),
+            action=ensure_str_list(frame_description.visible_actions),
+            context=_clip_text(" ".join(context_parts), 1000),
+            emotion=[],
         )
 
 
@@ -193,7 +329,8 @@ class RAGLLMClient:
             {
                 "role": "system",
                 "content": (
-                    "You expand Korean video search questions. Return only JSON."
+                    "You expand Korean video search questions. Return only JSON. "
+                    "Do not include reasoning."
                 ),
             },
             {
@@ -202,7 +339,8 @@ class RAGLLMClient:
                     "Create search expansions for this video RAG question. "
                     "Return JSON fields exactly as: expanded_queries (array of up to 3 Korean strings), "
                     "keywords (array of Korean or English terms). "
-                    "Keep expansions faithful to the question.\n\n"
+                    "Keep expansions faithful to the question. "
+                    "Return exactly one JSON object and no markdown. /no_think\n\n"
                     f"QUESTION: {question}"
                 ),
             },

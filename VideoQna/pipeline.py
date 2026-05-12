@@ -64,12 +64,17 @@ def load_env() -> None:
     load_dotenv(BASE_DIR / ".env", override=False)
 
 
+def read_json(path: Path):
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def cmd_index(args: argparse.Namespace) -> None:
     from tqdm import tqdm
 
     from embedding import QwenSummaryEmbedder
     from hf_clients import SummaryLLMClient, VideoVLMClient
     from keyframe_selector import KMeansKeyframeSelector
+    from models import Shot, SubtitleSegment
     from shot_detector import TransNetShotDetector
     from subtitle_context import subtitles_for_shot
     from subtitle_extractor import WhisperSubtitleExtractor
@@ -82,35 +87,64 @@ def cmd_index(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Video file not found: {video_path}")
 
     data_dir = Path(args.data_dir).expanduser().resolve()
-    run_id = f"{safe_stem(str(video_path))}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    run_dir = data_dir / "runs" / run_id
+    qdrant_path_value = (
+        os.getenv("QDRANT_PATH")
+        if args.qdrant_path == str(DEFAULT_DATA_DIR / "qdrant")
+        else args.qdrant_path
+    )
+    qdrant_path = Path(qdrant_path_value or args.qdrant_path).expanduser().resolve()
+    if args.resume_run:
+        run_dir = Path(args.resume_run).expanduser()
+        if not run_dir.is_absolute():
+            run_dir = (BASE_DIR / run_dir).resolve()
+        run_id = run_dir.name
+        if not run_dir.exists():
+            raise FileNotFoundError(f"resume run directory not found: {run_dir}")
+    else:
+        run_id = f"{safe_stem(str(video_path))}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        run_dir = data_dir / "runs" / run_id
     keyframe_dir = data_dir / "keyframes" / run_id
-    qdrant_path = Path(args.qdrant_path).expanduser().resolve()
 
     timer = IndexTimer()
     print(f"[index] video={video_path}")
     print(f"[index] run_dir={run_dir}")
 
     try:
-        with timer.step("whisper", model=args.whisper_model, device=args.whisper_device):
-            subtitles = WhisperSubtitleExtractor(
-                model_size=args.whisper_model,
-                language=args.language,
-                device=args.whisper_device,
-                compute_type=args.whisper_compute_type,
-            ).transcribe(video_path)
-            write_json(run_dir / "subtitles.json", [segment.to_dict() for segment in subtitles])
+        with timer.step("qdrant_setup", qdrant_path=str(qdrant_path)):
+            store = QdrantSummaryStore(qdrant_path=qdrant_path)
 
-        with timer.step("transnet", threshold=args.transnet_threshold, device=args.transnet_device):
-            shots = TransNetShotDetector(
-                threshold=args.transnet_threshold,
-                device=args.transnet_device,
-                proxy_width=args.proxy_width,
-                weights_path=args.transnet_weights,
-            ).detect(video_path, work_dir=run_dir / "transnet")
-            if args.max_shots:
-                shots = shots[: args.max_shots]
-            write_json(run_dir / "shots.json", [shot.to_dict() for shot in shots])
+        subtitles_path = run_dir / "subtitles.json"
+        shots_path = run_dir / "shots.json"
+
+        if args.resume_run and subtitles_path.exists():
+            with timer.step("load_subtitles", source=str(subtitles_path)):
+                subtitles = [SubtitleSegment(**item) for item in read_json(subtitles_path)]
+        else:
+            with timer.step("whisper", model=args.whisper_model, device=args.whisper_device):
+                subtitles = WhisperSubtitleExtractor(
+                    model_size=args.whisper_model,
+                    language=args.language,
+                    device=args.whisper_device,
+                    compute_type=args.whisper_compute_type,
+                ).transcribe(video_path)
+                write_json(subtitles_path, [segment.to_dict() for segment in subtitles])
+
+        if args.resume_run and shots_path.exists():
+            with timer.step("load_shots", source=str(shots_path)):
+                shots = [Shot(**item) for item in read_json(shots_path)]
+                if args.max_shots:
+                    shots = shots[: args.max_shots]
+        else:
+            with timer.step("transnet", threshold=args.transnet_threshold, device=args.transnet_device):
+                shots = TransNetShotDetector(
+                    threshold=args.transnet_threshold,
+                    device=args.transnet_device,
+                    proxy_width=args.proxy_width,
+                    weights_path=args.transnet_weights,
+                ).detect(video_path, work_dir=run_dir / "transnet")
+                if args.max_shots:
+                    shots = shots[: args.max_shots]
+                write_json(shots_path, [shot.to_dict() for shot in shots])
 
         hf_token = os.getenv("HF_TOKEN", "")
         hf_provider = os.getenv("HF_PROVIDER") or None
@@ -121,17 +155,35 @@ def cmd_index(args: argparse.Namespace) -> None:
         llm_model = os.getenv("HF_LLM_MODEL", args.llm_model)
         embedding_model = os.getenv("HF_EMBEDDING_MODEL", args.embedding_model)
 
-        with timer.step("client_setup", vlm_model=vlm_model, llm_model=llm_model, embedding_model=embedding_model):
+        effective_llm_model = "skipped" if args.skip_llm_summary else llm_model
+        with timer.step(
+            "client_setup",
+            vlm_model=vlm_model,
+            llm_model=effective_llm_model,
+            embedding_model=embedding_model,
+        ):
             vlm = VideoVLMClient(token=hf_token, model=vlm_model, provider=vlm_provider)
-            llm = SummaryLLMClient(token=hf_token, model=llm_model, provider=llm_provider)
+            llm = None
+            if not args.skip_llm_summary:
+                llm = SummaryLLMClient(token=hf_token, model=llm_model, provider=llm_provider)
             embedder = QwenSummaryEmbedder(
                 model_name=embedding_model,
                 token=hf_token,
                 provider=embedding_provider,
             )
-            store = QdrantSummaryStore(qdrant_path=qdrant_path)
 
-        records = []
+        records_path = run_dir / "indexed_scenes.json"
+        records = read_json(records_path) if args.resume_run and records_path.exists() else []
+        processed_shot_ids = {
+            int(item["shot"]["shot_id"])
+            for item in records
+            if isinstance(item, dict)
+            and isinstance(item.get("shot"), dict)
+            and item["shot"].get("shot_id") is not None
+        }
+        if processed_shot_ids:
+            print(f"[index] resume: skipping completed shots={sorted(processed_shot_ids)}")
+
         selector = KMeansKeyframeSelector(
             video_path=video_path,
             output_dir=keyframe_dir,
@@ -140,6 +192,10 @@ def cmd_index(args: argparse.Namespace) -> None:
         try:
             for shot in tqdm(shots, desc="shots", unit="shot"):
                 shot_label = f"shot_{shot.shot_id:04d}"
+                if shot.shot_id in processed_shot_ids:
+                    print(f"[index] skip {shot_label}: already in indexed_scenes.json")
+                    continue
+
                 with timer.step(f"{shot_label}.keyframe", shot_id=shot.shot_id):
                     keyframe = selector.select_one(shot)
                     shot_subtitles = subtitles_for_shot(
@@ -151,8 +207,20 @@ def cmd_index(args: argparse.Namespace) -> None:
                 with timer.step(f"{shot_label}.vlm", shot_id=shot.shot_id, model=vlm_model):
                     frame_description = vlm.describe_keyframe(keyframe.image_path)
 
-                with timer.step(f"{shot_label}.llm_summary", shot_id=shot.shot_id, model=llm_model):
-                    summary = llm.summarize_scene(frame_description, shot_subtitles)
+                with timer.step(
+                    f"{shot_label}.llm_summary",
+                    shot_id=shot.shot_id,
+                    model=effective_llm_model,
+                ):
+                    if args.skip_llm_summary:
+                        summary = SummaryLLMClient.fallback_summary(
+                            frame_description,
+                            shot_subtitles,
+                        )
+                    else:
+                        if llm is None:
+                            raise RuntimeError("LLM client is not initialized.")
+                        summary = llm.summarize_scene(frame_description, shot_subtitles)
 
                 with timer.step(f"{shot_label}.embedding", shot_id=shot.shot_id, model=embedding_model):
                     # The vector is intentionally generated from summary only.
@@ -187,7 +255,7 @@ def cmd_index(args: argparse.Namespace) -> None:
                     "shot_subtitles": [segment.to_dict() for segment in shot_subtitles],
                 }
                 records.append(record)
-                write_json(run_dir / "indexed_scenes.json", records)
+                write_json(records_path, records)
         finally:
             selector.close()
 
@@ -218,6 +286,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help="Artifacts directory")
     p_index.add_argument("--qdrant-path", default=default_qdrant_path, help="Local Qdrant path")
     p_index.add_argument("--max-shots", type=int, default=None, help="Process only first N shots")
+    p_index.add_argument("--resume-run", default=None, help="Reuse subtitles.json and shots.json from an existing run directory")
 
     p_index.add_argument("--whisper-model", default="base", help="faster-whisper model size")
     p_index.add_argument("--language", default=None, help="Whisper language code, e.g. ko/ja/en")
@@ -230,10 +299,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--proxy-width", type=int, default=320)
     p_index.add_argument("--candidate-stride", type=float, default=0.5)
     p_index.add_argument("--subtitle-padding", type=float, default=0.5)
+    p_index.add_argument(
+        "--skip-llm-summary",
+        action="store_true",
+        help="Skip remote LLM summary calls and build summaries from VLM output plus subtitles",
+    )
 
-    p_index.add_argument("--vlm-model", default="Qwen/Qwen3-VL-8B-Instruct")
+    p_index.add_argument("--vlm-model", default="Qwen/Qwen3.5-9B:together")
     p_index.add_argument("--llm-model", default="Qwen/Qwen3-8B")
-    p_index.add_argument("--embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
+    p_index.add_argument("--embedding-model", default="ibm-granite/granite-embedding-97m-multilingual-r2")
     p_index.set_defaults(func=cmd_index)
 
     p_stats = subparsers.add_parser("stats", help="Show Qdrant collection stats")

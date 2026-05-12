@@ -14,7 +14,18 @@ class QdrantSummaryStore:
 
         self.qdrant_path = Path(qdrant_path)
         self.qdrant_path.mkdir(parents=True, exist_ok=True)
-        self.client = QdrantClient(path=str(self.qdrant_path))
+        try:
+            self.client = QdrantClient(path=str(self.qdrant_path))
+        except RuntimeError as exc:
+            message = str(exc)
+            if "already accessed by another instance" in message:
+                raise RuntimeError(
+                    f"Qdrant local storage is locked: {self.qdrant_path}\n"
+                    "Stop the running API/server process that is using this path, "
+                    "or index into another --qdrant-path. Local Qdrant cannot be "
+                    "opened by multiple Python processes at the same time."
+                ) from exc
+            raise
 
     def upsert_scene(
         self,

@@ -33,23 +33,48 @@ class QdrantSummaryStore:
         vector: list[float],
         payload: dict[str, Any],
     ) -> str:
-        self._ensure_collection(collection, vector_size=len(vector))
+        return self.upsert_scenes(collection, [(vector, payload)])[0]
+
+    def upsert_scenes(
+        self,
+        collection: str,
+        scenes: list[tuple[list[float], dict[str, Any]]],
+    ) -> list[str]:
+        if not scenes:
+            return []
+
+        vector_size = len(scenes[0][0])
+        self._ensure_collection(collection, vector_size=vector_size)
         try:
             from qdrant_client.models import PointStruct
         except ImportError as exc:
             raise RuntimeError("qdrant-client models are unavailable.") from exc
 
-        point_id = str(
+        point_ids = []
+        points = []
+        for vector, payload in scenes:
+            if len(vector) != vector_size:
+                raise RuntimeError(
+                    f"Batch contains mixed vector sizes: {vector_size} and {len(vector)}."
+                )
+            point_id = self._scene_point_id(payload)
+            point_ids.append(point_id)
+            points.append(PointStruct(id=point_id, vector=vector, payload=payload))
+
+        self.client.upsert(
+            collection_name=collection,
+            points=points,
+        )
+        return point_ids
+
+    @staticmethod
+    def _scene_point_id(payload: dict[str, Any]) -> str:
+        return str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
                 f"{payload['video_path']}:{payload['shot_id']}:{payload['shot_start_sec']}",
             )
         )
-        self.client.upsert(
-            collection_name=collection,
-            points=[PointStruct(id=point_id, vector=vector, payload=payload)],
-        )
-        return point_id
 
     def collection_stats(self, collection: str) -> dict[str, Any]:
         if not self.collection_exists(collection):
@@ -66,6 +91,11 @@ class QdrantSummaryStore:
             "qdrant_path": str(self.qdrant_path),
             "points_count": count,
         }
+
+    def close(self) -> None:
+        close = getattr(self.client, "close", None)
+        if callable(close):
+            close()
 
     def collection_exists(self, collection: str) -> bool:
         return self._collection_exists(collection)

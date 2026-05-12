@@ -6,7 +6,6 @@ faster-whisper>=1.0.0
 transnetv2-pytorch>=1.0.3
 ffmpeg-python>=0.2.0
 torch>=2.2.0
-scikit-learn>=1.4.0
 huggingface-hub>=0.34.0
 openai>=1.0.0
 qdrant-client>=1.9.0

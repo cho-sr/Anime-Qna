@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+from device_utils import resolve_torch_device, resolve_whisper_compute_type
 from models import SubtitleSegment
 
 
@@ -11,8 +12,8 @@ class WhisperSubtitleExtractor:
         self,
         model_size: str = "base",
         language: Optional[str] = None,
-        device: str = "cpu",
-        compute_type: str = "int8",
+        device: str = "auto",
+        compute_type: str = "auto",
     ):
         self.model_size = model_size
         self.language = language
@@ -29,11 +30,16 @@ class WhisperSubtitleExtractor:
                     "faster-whisper is required. Install VideoQna/requirements.txt first."
                 ) from exc
 
-            print(f"[whisper] loading model={self.model_size} device={self.device}")
+            device = resolve_torch_device(self.device, label="whisper")
+            compute_type = resolve_whisper_compute_type(self.compute_type, device)
+            print(
+                f"[whisper] loading model={self.model_size} "
+                f"device={device} compute_type={compute_type}"
+            )
             self._model = WhisperModel(
                 self.model_size,
-                device=self.device,
-                compute_type=self.compute_type,
+                device=device,
+                compute_type=compute_type,
             )
 
     def transcribe(self, video_path: str | Path) -> list[SubtitleSegment]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ class RetrievalConfig:
     dense_top_k: int = 20
     bm25_top_k: int = 20
     rrf_k: int = 60
+    dense_workers: int = 3
 
 
 def payload_to_search_text(payload: dict[str, Any]) -> str:
@@ -166,6 +168,7 @@ class HybridRAGEngine:
             collection=collection,
             queries=search_queries,
             limit=config.dense_top_k,
+            workers=config.dense_workers,
         )
 
         payload_records = self.store.scroll_payloads(collection)
@@ -239,22 +242,20 @@ class HybridRAGEngine:
         collection: str,
         queries: list[str],
         limit: int,
+        workers: int = 1,
     ) -> tuple[list[list[str]], list[dict[str, Any]], dict[str, float]]:
         rankings: list[list[str]] = []
         debug: list[dict[str, Any]] = []
         best_scores: dict[str, float] = {}
 
-        for query in queries:
+        def search_one(index: int, query: str) -> tuple[int, list[str], list[dict[str, Any]]]:
             vector = self.embedder.embed_text(query)
             results = self.store.dense_search(collection, vector=vector, limit=limit)
             ranking = []
+            query_debug = []
             for rank, result in enumerate(results, start=1):
                 ranking.append(result["id"])
-                best_scores[result["id"]] = max(
-                    best_scores.get(result["id"], float("-inf")),
-                    float(result["score"]),
-                )
-                debug.append(
+                query_debug.append(
                     {
                         "query": query,
                         "rank": rank,
@@ -263,7 +264,36 @@ class HybridRAGEngine:
                         "payload": result["payload"],
                     }
                 )
+            return index, ranking, query_debug
+
+        workers = max(1, int(workers or 1))
+        ordered_results: list[tuple[list[str], list[dict[str, Any]]] | None] = [None] * len(queries)
+
+        if workers == 1 or len(queries) <= 1:
+            for index, query in enumerate(queries):
+                result_index, ranking, query_debug = search_one(index, query)
+                ordered_results[result_index] = (ranking, query_debug)
+        else:
+            with ThreadPoolExecutor(max_workers=min(workers, len(queries))) as executor:
+                futures = {
+                    executor.submit(search_one, index, query): index
+                    for index, query in enumerate(queries)
+                }
+                for future in as_completed(futures):
+                    result_index, ranking, query_debug = future.result()
+                    ordered_results[result_index] = (ranking, query_debug)
+
+        for item in ordered_results:
+            if item is None:
+                continue
+            ranking, query_debug = item
             rankings.append(ranking)
+            debug.extend(query_debug)
+            for row in query_debug:
+                best_scores[row["id"]] = max(
+                    best_scores.get(row["id"], float("-inf")),
+                    float(row["score"]),
+                )
 
         return rankings, debug, best_scores
 

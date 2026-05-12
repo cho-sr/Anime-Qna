@@ -4,7 +4,8 @@ VideoQna indexes a local video into Qdrant using this flow:
 
 1. Extract full-video subtitles with Whisper.
 2. Create a low-resolution proxy video and split shots with TransNetV2.
-3. Select one representative keyframe per shot using K-Means with `k=1`.
+3. Select one representative keyframe per shot by choosing the frame nearest
+   the shot's average visual feature centroid.
 4. Send only the keyframe image to a Hugging Face Router Qwen VLM API.
 5. Send the VLM frame description plus the full shot subtitles to a Qwen LLM API.
 6. Embed only the LLM `summary` with a Hugging Face feature-extraction API.
@@ -18,6 +19,13 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
+```
+
+CUDA is used automatically when PyTorch can see a CUDA GPU. You can verify the
+environment with:
+
+```bash
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
 ```
 
 Edit `.env` and set `HF_TOKEN`. The same token is used for VLM, LLM, and embedding API calls.
@@ -62,12 +70,30 @@ python pipeline.py index \
   --video /path/to/video.mp4 \
   --collection video_qna \
   --whisper-model base \
+  --whisper-device auto \
+  --whisper-compute-type auto \
   --language ko \
   --transnet-threshold 0.5 \
+  --transnet-device auto \
   --transnet-weights /path/to/transnetv2-pytorch-weights.pth \
   --proxy-width 320 \
+  --keyframe-workers 1 \
+  --api-workers 3 \
+  --qdrant-batch-size 16 \
   --candidate-stride 0.5
 ```
+
+With the default `auto` device setting, Whisper and TransNetV2 prefer CUDA and
+fall back to CPU when CUDA is unavailable. To require CUDA explicitly, pass
+`--whisper-device cuda --transnet-device cuda`.
+
+With `--keyframe-workers 1`, keyframes are extracted with a single-pass sampler:
+the video is scanned in timestamp order to avoid repeated random seeks. Values
+above `1` use parallel per-shot seeking, which can be faster on some SSDs but
+may be slower for long compressed videos. `--api-workers` runs the per-shot VLM,
+LLM summary, and embedding chain concurrently. `--qdrant-batch-size` controls
+how many completed shots are written per Qdrant upsert batch. Parallel API calls
+reduce wall-clock waiting time but do not reduce the number of remote requests.
 
 Indexing writes a timing report to each run directory:
 
@@ -109,14 +135,15 @@ curl -X POST http://localhost:8000/ask \
     "collection": "video_qna",
     "top_k": 5,
     "dense_top_k": 20,
-    "bm25_top_k": 20
+    "bm25_top_k": 20,
+    "dense_workers": 3
   }'
 ```
 
 The server performs:
 
 1. Qwen LLM query expansion.
-2. Dense retrieval with the configured embedding API against Qdrant vectors.
+2. Parallel dense retrieval with the configured embedding API against Qdrant vectors.
 3. Contextual BM25 over stored JSON payload fields.
 4. RRF fusion of dense and BM25 rankings.
 5. Qwen LLM answer generation with timestamped sources.

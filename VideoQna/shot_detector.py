@@ -7,6 +7,7 @@ from pathlib import Path
 import cv2
 from tqdm import tqdm
 
+from device_utils import resolve_torch_device
 from models import Shot
 
 
@@ -111,8 +112,9 @@ class TransNetShotDetector:
                 "transnetv2-pytorch is required. Install VideoQna/requirements.txt first."
             ) from exc
 
-        print(f"[transnet] detecting shots threshold={self.threshold} device={self.device}")
-        model = TransNetV2(device=self.device)
+        device = resolve_torch_device(self.device, label="transnet")
+        print(f"[transnet] detecting shots threshold={self.threshold} device={device}")
+        model = TransNetV2(device=device)
         self._load_weights_if_available(model)
         model.eval()
 

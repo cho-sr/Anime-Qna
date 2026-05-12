@@ -4,6 +4,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from threading import local
 from typing import Any
 
 from bm25 import BM25Index
@@ -33,10 +34,16 @@ def payload_to_search_text(payload: dict[str, Any]) -> str:
                 subtitle_texts.append(ensure_str(item))
 
     fields = [
+        ensure_str(payload.get("search_text")),
         ensure_str(payload.get("summary")),
         " ".join(ensure_str_list(payload.get("action"))),
         ensure_str(payload.get("context")),
         " ".join(ensure_str_list(payload.get("emotion"))),
+        " ".join(ensure_str_list(payload.get("people"))),
+        " ".join(ensure_str_list(payload.get("objects"))),
+        " ".join(ensure_str_list(payload.get("places"))),
+        " ".join(ensure_str_list(payload.get("visual_keywords"))),
+        " ".join(ensure_str_list(payload.get("dialogue_keywords"))),
         ensure_str(payload.get("frame_description")),
         " ".join(subtitle_texts),
     ]
@@ -82,6 +89,12 @@ def payload_to_source(
         "action": payload.get("action") or [],
         "context": payload.get("context") or "",
         "emotion": payload.get("emotion") or [],
+        "people": payload.get("people") or [],
+        "objects": payload.get("objects") or [],
+        "places": payload.get("places") or [],
+        "visual_keywords": payload.get("visual_keywords") or [],
+        "dialogue_keywords": payload.get("dialogue_keywords") or [],
+        "search_text": payload.get("search_text") or "",
         "frame_description": payload.get("frame_description") or "",
         "subtitles": subtitle_texts,
     }
@@ -97,20 +110,29 @@ class HybridRAGEngine:
         hf_provider: str | None = None,
         llm_provider: str | None = None,
         embedding_provider: str | None = None,
+        store: QdrantSummaryStore | None = None,
     ):
         if not hf_token:
             raise RuntimeError("HF_TOKEN is required for RAG query expansion, embedding, and answers.")
 
-        self.store = QdrantSummaryStore(qdrant_path=qdrant_path)
+        self.hf_token = hf_token
+        self.embedding_model = embedding_model
+        self.embedding_provider = embedding_provider or hf_provider
+        self.store = store or QdrantSummaryStore(qdrant_path=qdrant_path)
         self.embedder = QwenSummaryEmbedder(
             model_name=embedding_model,
             token=hf_token,
-            provider=embedding_provider or hf_provider,
+            provider=self.embedding_provider,
         )
         self.llm = RAGLLMClient(token=hf_token, model=llm_model, provider=llm_provider or hf_provider)
+        self._collection_cache: dict[str, dict[str, Any]] = {}
 
     @classmethod
-    def from_env(cls, qdrant_path: str | Path) -> "HybridRAGEngine":
+    def from_env(
+        cls,
+        qdrant_path: str | Path,
+        store: QdrantSummaryStore | None = None,
+    ) -> "HybridRAGEngine":
         hf_provider = os.getenv("HF_PROVIDER") or None
         return cls(
             qdrant_path=qdrant_path,
@@ -123,6 +145,14 @@ class HybridRAGEngine:
                 "HF_EMBEDDING_MODEL",
                 "ibm-granite/granite-embedding-97m-multilingual-r2",
             ),
+            store=store,
+        )
+
+    def _new_embedder(self) -> QwenSummaryEmbedder:
+        return QwenSummaryEmbedder(
+            model_name=self.embedding_model,
+            token=self.hf_token,
+            provider=self.embedding_provider,
         )
 
     def ask(self, question: str, collection: str, config: RetrievalConfig) -> dict[str, Any]:
@@ -171,9 +201,9 @@ class HybridRAGEngine:
             workers=config.dense_workers,
         )
 
-        payload_records = self.store.scroll_payloads(collection)
+        payload_records, bm25_index = self._collection_payloads_and_bm25(collection)
         bm25_query = " ".join([question, *expanded_queries, *keywords])
-        bm25_results = self._bm25_results(payload_records, bm25_query, config.bm25_top_k)
+        bm25_results = bm25_index.search(bm25_query, top_k=config.bm25_top_k)
         best_bm25_scores = {item["id"]: float(item["score"]) for item in bm25_results}
 
         rrf_scores = self._rrf([*dense_rankings, [item["id"] for item in bm25_results]], config.rrf_k)
@@ -248,8 +278,38 @@ class HybridRAGEngine:
         debug: list[dict[str, Any]] = []
         best_scores: dict[str, float] = {}
 
-        def search_one(index: int, query: str) -> tuple[int, list[str], list[dict[str, Any]]]:
-            vector = self.embedder.embed_text(query)
+        def embed_queries() -> list[tuple[str, list[float]]]:
+            ordered_vectors: list[tuple[str, list[float]] | None] = [None] * len(queries)
+            workers_count = max(1, int(workers or 1))
+            if workers_count == 1 or len(queries) <= 1:
+                for index, query in enumerate(queries):
+                    ordered_vectors[index] = (query, self.embedder.embed_query(query))
+                return [item for item in ordered_vectors if item is not None]
+
+            worker_state = local()
+
+            def get_worker_embedder() -> QwenSummaryEmbedder:
+                embedder = getattr(worker_state, "embedder", None)
+                if embedder is None:
+                    embedder = self._new_embedder()
+                    worker_state.embedder = embedder
+                return embedder
+
+            def embed_one(index: int, query: str) -> tuple[int, str, list[float]]:
+                return index, query, get_worker_embedder().embed_query(query)
+
+            with ThreadPoolExecutor(max_workers=min(workers_count, len(queries))) as executor:
+                futures = {
+                    executor.submit(embed_one, index, query): index
+                    for index, query in enumerate(queries)
+                }
+                for future in as_completed(futures):
+                    index, query, vector = future.result()
+                    ordered_vectors[index] = (query, vector)
+
+            return [item for item in ordered_vectors if item is not None]
+
+        for query, vector in embed_queries():
             results = self.store.dense_search(collection, vector=vector, limit=limit)
             ranking = []
             query_debug = []
@@ -264,29 +324,6 @@ class HybridRAGEngine:
                         "payload": result["payload"],
                     }
                 )
-            return index, ranking, query_debug
-
-        workers = max(1, int(workers or 1))
-        ordered_results: list[tuple[list[str], list[dict[str, Any]]] | None] = [None] * len(queries)
-
-        if workers == 1 or len(queries) <= 1:
-            for index, query in enumerate(queries):
-                result_index, ranking, query_debug = search_one(index, query)
-                ordered_results[result_index] = (ranking, query_debug)
-        else:
-            with ThreadPoolExecutor(max_workers=min(workers, len(queries))) as executor:
-                futures = {
-                    executor.submit(search_one, index, query): index
-                    for index, query in enumerate(queries)
-                }
-                for future in as_completed(futures):
-                    result_index, ranking, query_debug = future.result()
-                    ordered_results[result_index] = (ranking, query_debug)
-
-        for item in ordered_results:
-            if item is None:
-                continue
-            ranking, query_debug = item
             rankings.append(ranking)
             debug.extend(query_debug)
             for row in query_debug:
@@ -297,12 +334,17 @@ class HybridRAGEngine:
 
         return rankings, debug, best_scores
 
-    @staticmethod
-    def _bm25_results(
-        payload_records: list[dict[str, Any]],
-        query: str,
-        top_k: int,
-    ) -> list[dict[str, Any]]:
+    def _collection_payloads_and_bm25(
+        self,
+        collection: str,
+    ) -> tuple[list[dict[str, Any]], BM25Index]:
+        stats = self.store.collection_stats(collection)
+        points_count = int(stats.get("points_count") or 0)
+        cached = self._collection_cache.get(collection)
+        if cached and cached.get("points_count") == points_count:
+            return cached["payload_records"], cached["bm25_index"]
+
+        payload_records = self.store.scroll_payloads(collection)
         documents = [
             {
                 "id": record["id"],
@@ -311,7 +353,13 @@ class HybridRAGEngine:
             }
             for record in payload_records
         ]
-        return BM25Index(documents).search(query, top_k=top_k)
+        bm25_index = BM25Index(documents)
+        self._collection_cache[collection] = {
+            "points_count": points_count,
+            "payload_records": payload_records,
+            "bm25_index": bm25_index,
+        }
+        return payload_records, bm25_index
 
     @staticmethod
     def _rrf(rankings: list[list[str]], k: int = 60) -> dict[str, float]:

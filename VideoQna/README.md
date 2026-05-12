@@ -8,7 +8,7 @@ VideoQna indexes a local video into Qdrant using this flow:
    the shot's average visual feature centroid.
 4. Send only the keyframe image to a Hugging Face Router Qwen VLM API.
 5. Send the VLM frame description plus the full shot subtitles to a Qwen LLM API.
-6. Embed only the LLM `summary` with a Hugging Face feature-extraction API.
+6. Embed the LLM `search_text` retrieval document with a Hugging Face feature-extraction API.
 7. Store the vector and JSON metadata in local persistent Qdrant.
 
 ## Setup
@@ -21,7 +21,9 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-CUDA is used automatically when PyTorch can see a CUDA GPU. You can verify the
+CUDA is used automatically when PyTorch and CTranslate2 can see a CUDA GPU.
+`requirements.txt` pins the PyTorch `cu121` wheel so Windows installs do not
+accidentally pick a newer incompatible CPU/CUDA build. You can verify the
 environment with:
 
 ```bash
@@ -48,6 +50,11 @@ feature extraction, for example:
 HF_EMBEDDING_PROVIDER=scaleway
 HF_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-8B
 ```
+
+For Qwen3 embedding models, query embeddings are formatted with an English
+retrieval instruction, while stored scene documents are embedded without an
+instruction. This follows the Qwen3 embedding model card guidance for
+instruction-aware retrieval.
 
 TransNetV2 also needs the system `ffmpeg` executable:
 
@@ -94,6 +101,9 @@ may be slower for long compressed videos. `--api-workers` runs the per-shot VLM,
 LLM summary, and embedding chain concurrently. `--qdrant-batch-size` controls
 how many completed shots are written per Qdrant upsert batch. Parallel API calls
 reduce wall-clock waiting time but do not reduce the number of remote requests.
+Completed per-shot API results are also checkpointed to `api_results.jsonl`
+before Qdrant writes, so `--resume-run` can avoid repeating successful remote
+calls after an interruption.
 
 Indexing writes a timing report to each run directory:
 
@@ -144,7 +154,8 @@ The server performs:
 
 1. Qwen LLM query expansion.
 2. Parallel dense retrieval with the configured embedding API against Qdrant vectors.
-3. Contextual BM25 over stored JSON payload fields.
+3. Contextual BM25 over stored JSON payload fields. Payloads and the BM25 index
+   are cached per collection while the point count is unchanged.
 4. RRF fusion of dense and BM25 rankings.
 5. Qwen LLM answer generation with timestamped sources.
 
@@ -156,4 +167,6 @@ Qdrant stores the vector for `summary` only. The payload also keeps:
 - `keyframe_timestamp_sec`, `image_path`
 - `frame_description`, `shot_subtitles`
 - `summary`, `action`, `context`, `emotion`
+- `people`, `objects`, `places`, `visual_keywords`, `dialogue_keywords`
+- `search_text` used as the embedding document text
 - `vlm_model`, `llm_model`, `embedding_model`

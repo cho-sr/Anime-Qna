@@ -16,6 +16,18 @@ def cuda_is_available() -> tuple[bool, str | None]:
         return True, None
 
 
+def ctranslate2_cuda_is_available() -> bool:
+    try:
+        import ctranslate2
+    except Exception:
+        return False
+
+    try:
+        return int(ctranslate2.get_cuda_device_count()) > 0
+    except Exception:
+        return False
+
+
 def resolve_torch_device(requested: str | None = "auto", *, label: str = "model") -> str:
     value = (requested or "auto").strip().lower()
     if value not in {"auto", "cuda"}:
@@ -36,6 +48,26 @@ def resolve_torch_device(requested: str | None = "auto", *, label: str = "model"
         return "cuda"
 
     print(f"[device] {label}: cuda not available; using cpu")
+    return "cpu"
+
+
+def resolve_whisper_device(requested: str | None = "auto") -> str:
+    value = (requested or "auto").strip().lower()
+    if value not in {"auto", "cuda"}:
+        return requested or "cpu"
+
+    if value == "cuda":
+        if ctranslate2_cuda_is_available():
+            print("[device] whisper: using cuda (CTranslate2)")
+        else:
+            print("[device] whisper: cuda requested; CTranslate2 does not report CUDA availability")
+        return "cuda"
+
+    if ctranslate2_cuda_is_available():
+        print("[device] whisper: auto selected cuda (CTranslate2)")
+        return "cuda"
+
+    print("[device] whisper: CTranslate2 cuda not available; using cpu")
     return "cpu"
 
 

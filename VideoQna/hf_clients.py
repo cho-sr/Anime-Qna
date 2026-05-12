@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+import random
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -78,6 +80,8 @@ class HuggingFaceChatClient:
         token: str,
         provider: Optional[str] = None,
         timeout: float = 120.0,
+        max_retries: int = 3,
+        retry_base_delay: float = 1.0,
     ):
         if not token:
             raise RuntimeError("HF_TOKEN is required for Hugging Face model calls.")
@@ -90,6 +94,8 @@ class HuggingFaceChatClient:
             ) from exc
 
         self.provider = provider
+        self.max_retries = max(1, int(max_retries))
+        self.retry_base_delay = max(0.1, float(retry_base_delay))
         self.client = OpenAI(
             base_url="https://router.huggingface.co/v1",
             api_key=token,
@@ -108,7 +114,7 @@ class HuggingFaceChatClient:
 
         for attempt in range(2):
             try:
-                response = self.client.chat.completions.create(
+                response = self._create_completion(
                     model=self._router_model(model),
                     messages=active_messages,
                     max_tokens=max_tokens,
@@ -141,7 +147,7 @@ class HuggingFaceChatClient:
         temperature: float = 0.2,
     ) -> str:
         try:
-            response = self.client.chat.completions.create(
+            response = self._create_completion(
                 model=self._router_model(model),
                 messages=messages,
                 max_tokens=max_tokens,
@@ -151,10 +157,55 @@ class HuggingFaceChatClient:
             raise RuntimeError(self._format_hf_error(model, exc)) from exc
         return _message_content(response).strip()
 
+    def _create_completion(self, **kwargs):
+        last_exc: Exception | None = None
+        for attempt in range(self.max_retries):
+            try:
+                return self.client.chat.completions.create(**kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= self.max_retries - 1 or not self._is_retryable_error(exc):
+                    raise
+                self._sleep_before_retry(attempt, exc)
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Completion request failed without an exception.")
+
+    def _sleep_before_retry(self, attempt: int, exc: Exception) -> None:
+        delay = min(30.0, self.retry_base_delay * (2**attempt))
+        delay += random.uniform(0.0, delay * 0.25)
+        print(
+            f"[retry] HF chat transient error; retrying in {delay:.1f}s "
+            f"({type(exc).__name__})"
+        )
+        time.sleep(delay)
+
     def _router_model(self, model: str) -> str:
         if ":" in model or not self.provider:
             return model
         return f"{model}:{self.provider}"
+
+    @staticmethod
+    def _is_retryable_error(exc: Exception) -> bool:
+        status_code = getattr(exc, "status_code", None)
+        if status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
+            return True
+
+        message = str(exc).lower()
+        retryable_markers = [
+            "429",
+            "rate limit",
+            "timeout",
+            "timed out",
+            "temporarily",
+            "try again",
+            "503",
+            "502",
+            "504",
+            "connection",
+        ]
+        return any(marker in message for marker in retryable_markers)
 
     @staticmethod
     def _format_hf_error(model: str, exc: Exception) -> str:
@@ -181,8 +232,9 @@ class VideoVLMClient:
             {
                 "role": "system",
                 "content": (
-                    "You describe a single video keyframe. Return only JSON in Korean. "
-                    "Do not include reasoning."
+                    "You extract visual retrieval metadata from a single video keyframe. "
+                    "Return only valid JSON in Korean. Describe only visible evidence. "
+                    "Do not infer dialogue, names, plot, or unseen context. Do not include reasoning."
                 ),
             },
             {
@@ -195,18 +247,24 @@ class VideoVLMClient:
                     {
                         "type": "text",
                         "text": (
-                            "Describe only what is visible in this keyframe. "
-                            "Do not infer dialogue or unseen context. "
-                            "Return JSON with fields: frame_description, "
-                            "visible_objects, visible_actions. "
-                            "Return exactly one JSON object and no markdown. /no_think"
+                            "Create compact metadata that will later be embedded for Korean video search. "
+                            "Return JSON fields exactly as:\n"
+                            "- frame_description: one Korean sentence about the visible scene\n"
+                            "- visible_objects: array of concrete visible nouns\n"
+                            "- visible_actions: array of visible actions or postures\n"
+                            "- people: array of visible person descriptions, roles, or counts; no names unless visible\n"
+                            "- setting: short visible place/background description\n"
+                            "- visible_text: array of readable text/OCR seen in the image\n"
+                            "- visual_keywords: array of Korean search keywords and common synonyms from the image\n\n"
+                            "Prefer concrete searchable words over poetic wording. "
+                            "Use [] or empty string when unknown. Return exactly one JSON object and no markdown. /no_think"
                         ),
                     },
                 ],
             },
         ]
         try:
-            data = self.chat.chat_json(self.model, messages, max_tokens=700)
+            data = self.chat.chat_json(self.model, messages, max_tokens=900)
         except RuntimeError as exc:
             if "Model did not return valid JSON" not in str(exc):
                 raise
@@ -216,6 +274,10 @@ class VideoVLMClient:
                 frame_description="키프레임 이미지 설명을 생성하지 못했습니다.",
                 visible_objects=[],
                 visible_actions=[],
+                people=[],
+                setting="",
+                visible_text=[],
+                visual_keywords=[],
             )
 
         return FrameDescription(
@@ -224,6 +286,10 @@ class VideoVLMClient:
             ),
             visible_objects=ensure_str_list(data.get("visible_objects")),
             visible_actions=ensure_str_list(data.get("visible_actions")),
+            people=ensure_str_list(data.get("people")),
+            setting=ensure_str(data.get("setting")),
+            visible_text=ensure_str_list(data.get("visible_text")),
+            visual_keywords=ensure_str_list(data.get("visual_keywords")),
         )
 
     @staticmethod
@@ -251,24 +317,38 @@ class SummaryLLMClient:
             {
                 "role": "system",
                 "content": (
-                    "You summarize a video shot using a visual description and "
-                    "the full subtitles overlapping that shot. Return only JSON in Korean."
-                    " Do not include reasoning."
+                    "You create retrieval-optimized Korean metadata for one video shot. "
+                    "Use the visual evidence and overlapping subtitles only. "
+                    "The output will be embedded as a retrieval document for Qwen3 Embedding, "
+                    "so use concrete Korean nouns, verbs, and likely user query terms. "
+                    "Do not invent facts, names, emotions, or locations that are not supported. "
+                    "Return only valid JSON. Do not include reasoning."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    "Create a concise searchable scene summary. "
-                    "Return JSON fields exactly as: summary (string), "
-                    "action (array of strings), context (string), emotion (array of strings).\n\n"
+                    "Create a concise searchable scene record. "
+                    "Return JSON fields exactly as:\n"
+                    "- summary: 1-2 natural Korean sentences combining visual evidence and subtitles\n"
+                    "- action: array of concrete actions/events\n"
+                    "- context: short factual context from subtitles and visible scene\n"
+                    "- emotion: array of supported emotions or tones; [] if unclear\n"
+                    "- people: array of people/roles/descriptions mentioned or visible\n"
+                    "- objects: array of important objects/items\n"
+                    "- places: array of visible or mentioned places/settings\n"
+                    "- visual_keywords: array of Korean visual search terms and synonyms\n"
+                    "- dialogue_keywords: array of important spoken/subtitle keywords\n"
+                    "- search_text: 3-6 short Korean lines optimized for semantic retrieval. "
+                    "Include summary, key actions, people/objects/places, visual keywords, and dialogue keywords. "
+                    "Use repeated important terms naturally, but do not stuff unrelated keywords.\n\n"
                     "Return exactly one JSON object and no markdown. /no_think\n\n"
                     f"INPUT_JSON:\n{json.dumps(payload, ensure_ascii=False)}"
                 ),
             },
         ]
         try:
-            data = self.chat.chat_json(self.model, messages, max_tokens=900)
+            data = self.chat.chat_json(self.model, messages, max_tokens=1200)
         except RuntimeError as exc:
             if "Model did not return valid JSON" not in str(exc):
                 raise
@@ -281,10 +361,22 @@ class SummaryLLMClient:
             action=ensure_str_list(data.get("action")),
             context=ensure_str(data.get("context")),
             emotion=ensure_str_list(data.get("emotion")),
+            people=ensure_str_list(data.get("people")),
+            objects=ensure_str_list(data.get("objects")),
+            places=ensure_str_list(data.get("places")),
+            visual_keywords=ensure_str_list(data.get("visual_keywords")),
+            dialogue_keywords=ensure_str_list(data.get("dialogue_keywords")),
+            search_text=ensure_str(data.get("search_text")),
         )
         if not summary.summary:
             print("[warn] LLM summary JSON omitted summary; using fallback summary.")
             return self.fallback_summary(frame_description, shot_subtitles)
+        if not summary.search_text:
+            summary.search_text = self.search_text_from_summary(
+                summary,
+                frame_description,
+                shot_subtitles,
+            )
         return summary
 
     @staticmethod
@@ -311,12 +403,50 @@ class SummaryLLMClient:
         if subtitle_text:
             context_parts.append(f"자막: {subtitle_text}")
 
-        return SceneSummary(
+        fallback = SceneSummary(
             summary=_clip_text(summary, 700),
             action=ensure_str_list(frame_description.visible_actions),
             context=_clip_text(" ".join(context_parts), 1000),
             emotion=[],
+            people=ensure_str_list(frame_description.people),
+            objects=ensure_str_list(frame_description.visible_objects),
+            places=ensure_str_list(frame_description.setting),
+            visual_keywords=ensure_str_list(frame_description.visual_keywords),
+            dialogue_keywords=[],
         )
+        fallback.search_text = SummaryLLMClient.search_text_from_summary(
+            fallback,
+            frame_description,
+            shot_subtitles,
+        )
+        return fallback
+
+    @staticmethod
+    def search_text_from_summary(
+        summary: SceneSummary,
+        frame_description: FrameDescription,
+        shot_subtitles: list[SubtitleSegment],
+    ) -> str:
+        subtitle_text = " ".join(
+            ensure_str(segment.text) for segment in shot_subtitles if ensure_str(segment.text)
+        )
+        parts = [
+            f"요약: {summary.summary}",
+            f"행동: {', '.join(summary.action)}" if summary.action else "",
+            f"맥락: {summary.context}" if summary.context else "",
+            f"인물: {', '.join(summary.people)}" if summary.people else "",
+            f"사물: {', '.join(summary.objects)}" if summary.objects else "",
+            f"장소: {', '.join(summary.places)}" if summary.places else "",
+            f"화면 키워드: {', '.join(summary.visual_keywords)}" if summary.visual_keywords else "",
+            (
+                f"대사 키워드: {', '.join(summary.dialogue_keywords)}"
+                if summary.dialogue_keywords
+                else ""
+            ),
+            f"화면 설명: {frame_description.frame_description}",
+            f"자막: {_clip_text(subtitle_text, 500)}" if subtitle_text else "",
+        ]
+        return _clip_text("\n".join(part for part in parts if part), 1800)
 
 
 class RAGLLMClient:
@@ -365,6 +495,11 @@ class RAGLLMClient:
                     "action": source.get("action"),
                     "context": source.get("context"),
                     "emotion": source.get("emotion"),
+                    "people": source.get("people"),
+                    "objects": source.get("objects"),
+                    "places": source.get("places"),
+                    "visual_keywords": source.get("visual_keywords"),
+                    "dialogue_keywords": source.get("dialogue_keywords"),
                     "frame_description": source.get("frame_description"),
                     "subtitles": source.get("subtitles"),
                 }

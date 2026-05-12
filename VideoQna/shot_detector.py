@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 from pathlib import Path
+from stat import S_IXGRP, S_IXOTH, S_IXUSR
 
 import cv2
 from tqdm import tqdm
@@ -144,13 +145,43 @@ class TransNetShotDetector:
     def _ensure_ffmpeg() -> None:
         if shutil.which("ffmpeg"):
             return
+        if TransNetShotDetector._install_imageio_ffmpeg_shim():
+            return
         raise RuntimeError(
             "ffmpeg executable was not found. TransNetV2 requires the system ffmpeg command. "
             "Install it with one of:\n"
             "  conda install -c conda-forge ffmpeg\n"
             "  brew install ffmpeg\n"
+            "  pip install imageio-ffmpeg\n"
             "Then restart the terminal and run the indexing command again."
         )
+
+    @staticmethod
+    def _install_imageio_ffmpeg_shim() -> bool:
+        try:
+            import imageio_ffmpeg
+        except ImportError:
+            return False
+
+        ffmpeg_exe = Path(imageio_ffmpeg.get_ffmpeg_exe()).expanduser().resolve()
+        if not ffmpeg_exe.exists():
+            return False
+
+        shim_dir = Path(__file__).resolve().parent / "data" / "bin"
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            shim_path = shim_dir / "ffmpeg.cmd"
+            shim_path.write_text(f'@echo off\r\n"{ffmpeg_exe}" %*\r\n', encoding="utf-8")
+        else:
+            shim_path = shim_dir / "ffmpeg"
+            shim_path.write_text(f'#!/bin/sh\nexec "{ffmpeg_exe}" "$@"\n', encoding="utf-8")
+            shim_path.chmod(shim_path.stat().st_mode | S_IXUSR | S_IXGRP | S_IXOTH)
+
+        os.environ["PATH"] = f"{shim_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+        if shutil.which("ffmpeg"):
+            print(f"[transnet] using imageio-ffmpeg shim: {ffmpeg_exe}")
+            return True
+        return False
 
     def _load_weights_if_available(self, model) -> None:
         weights_path = self.weights_path or self._find_weights_path()

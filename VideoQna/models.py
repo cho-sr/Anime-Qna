@@ -46,6 +46,10 @@ class FrameDescription:
     frame_description: str
     visible_objects: list[str] = field(default_factory=list)
     visible_actions: list[str] = field(default_factory=list)
+    people: list[str] = field(default_factory=list)
+    setting: str = ""
+    visible_text: list[str] = field(default_factory=list)
+    visual_keywords: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -57,6 +61,12 @@ class SceneSummary:
     action: list[str] = field(default_factory=list)
     context: str = ""
     emotion: list[str] = field(default_factory=list)
+    people: list[str] = field(default_factory=list)
+    objects: list[str] = field(default_factory=list)
+    places: list[str] = field(default_factory=list)
+    visual_keywords: list[str] = field(default_factory=list)
+    dialogue_keywords: list[str] = field(default_factory=list)
+    search_text: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

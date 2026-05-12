@@ -70,6 +70,26 @@ def read_json(path: Path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def read_jsonl(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    rows = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        line = line.strip()
+        if line:
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError as exc:
+                print(f"[warn] skipping invalid JSONL row {path}:{line_number}: {exc}")
+    return rows
+
+
+def append_jsonl(path: Path, item: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
 def worker_count(value: int | None) -> int:
     return max(1, int(value or 1))
 
@@ -90,7 +110,7 @@ def cmd_index(args: argparse.Namespace) -> None:
         select_keyframe_for_shot,
         select_keyframes_single_pass,
     )
-    from models import Shot, SubtitleSegment
+    from models import FrameDescription, Keyframe, SceneSummary, Shot, SubtitleSegment
     from shot_detector import TransNetShotDetector
     from subtitle_context import subtitles_for_shot
     from subtitle_extractor import WhisperSubtitleExtractor
@@ -190,6 +210,7 @@ def cmd_index(args: argparse.Namespace) -> None:
             )
 
         records_path = run_dir / "indexed_scenes.json"
+        api_results_path = run_dir / "api_results.jsonl"
         records = read_json(records_path) if args.resume_run and records_path.exists() else []
         processed_shot_ids = {
             int(item["shot"]["shot_id"])
@@ -201,6 +222,50 @@ def cmd_index(args: argparse.Namespace) -> None:
         if processed_shot_ids:
             print(f"[index] resume: skipping completed shots={sorted(processed_shot_ids)}")
 
+        def api_checkpoint_record(result) -> dict:
+            return {
+                "shot": result["shot"].to_dict(),
+                "keyframe": result["keyframe"].to_dict(),
+                "frame_description": result["frame_description"].to_dict(),
+                "summary": result["summary"].to_dict(),
+                "shot_subtitles": [
+                    segment.to_dict() for segment in result["shot_subtitles"]
+                ],
+                "vector": result["vector"],
+            }
+
+        def result_from_api_checkpoint(item: dict):
+            shot = Shot(**item["shot"])
+            return {
+                "shot": shot,
+                "keyframe": Keyframe(**item["keyframe"]),
+                "shot_subtitles": [
+                    SubtitleSegment(**segment)
+                    for segment in item.get("shot_subtitles", [])
+                ],
+                "frame_description": FrameDescription(**item["frame_description"]),
+                "summary": SceneSummary(**item["summary"]),
+                "vector": item["vector"],
+            }
+
+        checkpoint_by_shot = {}
+        for item in read_jsonl(api_results_path):
+            try:
+                result = result_from_api_checkpoint(item)
+            except Exception as exc:
+                print(f"[warn] skipping invalid API checkpoint row: {type(exc).__name__}: {exc}")
+                continue
+
+            shot_id = result["shot"].shot_id
+            if shot_id not in processed_shot_ids:
+                checkpoint_by_shot[shot_id] = result
+
+        if checkpoint_by_shot:
+            print(
+                "[index] resume: restoring API results for shots="
+                f"{sorted(checkpoint_by_shot)}"
+            )
+
         keyframe_workers = worker_count(args.keyframe_workers)
         api_workers = worker_count(args.api_workers)
         qdrant_batch_size = worker_count(args.qdrant_batch_size)
@@ -209,6 +274,9 @@ def cmd_index(args: argparse.Namespace) -> None:
             shot_label = f"shot_{shot.shot_id:04d}"
             if shot.shot_id in processed_shot_ids:
                 print(f"[index] skip {shot_label}: already in indexed_scenes.json")
+                continue
+            if shot.shot_id in checkpoint_by_shot:
+                print(f"[index] skip {shot_label}: found in api_results.jsonl")
                 continue
             pending_shots.append(shot)
 
@@ -304,8 +372,8 @@ def cmd_index(args: argparse.Namespace) -> None:
                     raise RuntimeError("LLM client is not initialized.")
                 summary = scene_llm.summarize_scene(frame_description, shot_subtitles)
 
-            # The vector is intentionally generated from summary only.
-            vector = scene_embedder.embed_summary(summary.summary)
+            embedding_text = summary.search_text or summary.summary
+            vector = scene_embedder.embed_document(embedding_text)
             return {
                 "shot": shot,
                 "keyframe": keyframe,
@@ -334,6 +402,12 @@ def cmd_index(args: argparse.Namespace) -> None:
                 "action": summary.action,
                 "context": summary.context,
                 "emotion": summary.emotion,
+                "people": summary.people,
+                "objects": summary.objects,
+                "places": summary.places,
+                "visual_keywords": summary.visual_keywords,
+                "dialogue_keywords": summary.dialogue_keywords,
+                "search_text": summary.search_text,
                 "vlm_model": vlm_model,
                 "llm_model": llm_model,
                 "embedding_model": embedding_model,
@@ -378,9 +452,21 @@ def cmd_index(args: argparse.Namespace) -> None:
             records.sort(key=record_sort_key)
             write_json(records_path, records)
 
-        def queue_scene_result(result) -> None:
+        def queue_scene_result(result, *, persist_checkpoint: bool = True) -> None:
+            if persist_checkpoint:
+                append_jsonl(api_results_path, api_checkpoint_record(result))
             pending_upserts.append(result)
             if len(pending_upserts) >= qdrant_batch_size:
+                flush_scene_results()
+
+        if checkpoint_by_shot:
+            with timer.step(
+                "api_checkpoint_restore",
+                shots=len(checkpoint_by_shot),
+                qdrant_batch_size=qdrant_batch_size,
+            ):
+                for result in checkpoint_by_shot.values():
+                    queue_scene_result(result, persist_checkpoint=False)
                 flush_scene_results()
 
         if prepared_scenes:

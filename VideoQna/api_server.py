@@ -58,6 +58,12 @@ class Source(BaseModel):
     action: list[Any] = Field(default_factory=list)
     context: str = ""
     emotion: list[Any] = Field(default_factory=list)
+    people: list[Any] = Field(default_factory=list)
+    objects: list[Any] = Field(default_factory=list)
+    places: list[Any] = Field(default_factory=list)
+    visual_keywords: list[Any] = Field(default_factory=list)
+    dialogue_keywords: list[Any] = Field(default_factory=list)
+    search_text: str = ""
     frame_description: str = ""
     subtitles: list[dict[str, Any]] = Field(default_factory=list)
 
@@ -71,8 +77,13 @@ class AskResponse(BaseModel):
 
 
 @lru_cache(maxsize=1)
+def get_store() -> QdrantSummaryStore:
+    return QdrantSummaryStore(default_qdrant_path())
+
+
+@lru_cache(maxsize=1)
 def get_engine() -> HybridRAGEngine:
-    return HybridRAGEngine.from_env(default_qdrant_path())
+    return HybridRAGEngine.from_env(default_qdrant_path(), store=get_store())
 
 
 @app.get("/health")
@@ -111,8 +122,7 @@ async def keyframe_image(path: str = Query(..., min_length=1)):
 
 @app.get("/stats/{collection}")
 async def stats(collection: str):
-    store = QdrantSummaryStore(default_qdrant_path())
-    return store.collection_stats(collection)
+    return get_store().collection_stats(collection)
 
 
 @app.post("/ask", response_model=AskResponse)

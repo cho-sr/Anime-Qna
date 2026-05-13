@@ -49,12 +49,13 @@ class WhisperSubtitleExtractor:
 
         self._load_model()
         print(f"[whisper] transcribing: {video_path}")
-        segments, info = self._model.transcribe(
-            str(video_path),
-            language=self.language,
-            beam_size=5,
-            vad_filter=True,
-        )
+        try:
+            segments, info = self._transcribe_with_vad(video_path, vad_filter=True)
+        except RuntimeError as exc:
+            if "VAD" not in str(exc) and "onnxruntime" not in str(exc).lower():
+                raise
+            print(f"[warn] whisper VAD unavailable; retrying without VAD: {exc}")
+            segments, info = self._transcribe_with_vad(video_path, vad_filter=False)
 
         subtitles: list[SubtitleSegment] = []
         for index, segment in enumerate(segments):
@@ -72,4 +73,12 @@ class WhisperSubtitleExtractor:
 
         print(f"[whisper] done: {len(subtitles)} segments, language={info.language}")
         return subtitles
+
+    def _transcribe_with_vad(self, video_path: Path, *, vad_filter: bool):
+        return self._model.transcribe(
+            str(video_path),
+            language=self.language,
+            beam_size=5,
+            vad_filter=vad_filter,
+        )
 

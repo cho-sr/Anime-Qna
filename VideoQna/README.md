@@ -30,6 +30,12 @@ environment with:
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
 ```
 
+On Windows, faster-whisper through CTranslate2 also needs cuDNN 8 DLLs for
+Whisper CUDA execution. If CTranslate2 sees the GPU but `cudnn_ops_infer64_8.dll`
+is not on `PATH`, VideoQna falls back to CPU for Whisper while keeping PyTorch
+CUDA available for TransNetV2. If ONNX Runtime is unavailable, Whisper retries
+without the optional VAD filter.
+
 Edit `.env` and set `HF_TOKEN`. The same token is used for VLM, LLM, and embedding API calls.
 Chat/VLM calls use the Hugging Face Router's OpenAI-compatible API. You can
 pin a provider either in the model id or with a provider variable:
@@ -42,9 +48,8 @@ HF_VLM_PROVIDER=together
 ```
 
 Embedding calls use Hugging Face feature extraction through `huggingface_hub`.
-The default `.env.example` uses an `hf-inference` multilingual embedding model.
-If you want to keep Qwen3 embeddings, use a provider/model pair that supports
-feature extraction, for example:
+The default `.env.example` uses Qwen3 Embedding through a provider/model pair
+that supports feature extraction:
 
 ```env
 HF_EMBEDDING_PROVIDER=scaleway
@@ -56,7 +61,9 @@ retrieval instruction, while stored scene documents are embedded without an
 instruction. This follows the Qwen3 embedding model card guidance for
 instruction-aware retrieval.
 
-TransNetV2 also needs the system `ffmpeg` executable:
+TransNetV2 uses the system `ffmpeg` executable when available. If it is missing,
+VideoQna falls back to the `imageio-ffmpeg` binary installed by `requirements.txt`.
+You can also install ffmpeg directly:
 
 ```bash
 conda install -c conda-forge ffmpeg

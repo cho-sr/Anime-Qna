@@ -170,8 +170,9 @@ class TransNetShotDetector:
         shim_dir = Path(__file__).resolve().parent / "data" / "bin"
         shim_dir.mkdir(parents=True, exist_ok=True)
         if os.name == "nt":
-            shim_path = shim_dir / "ffmpeg.cmd"
-            shim_path.write_text(f'@echo off\r\n"{ffmpeg_exe}" %*\r\n', encoding="utf-8")
+            shim_path = shim_dir / "ffmpeg.exe"
+            if not shim_path.exists() or shim_path.stat().st_size != ffmpeg_exe.stat().st_size:
+                shutil.copy2(ffmpeg_exe, shim_path)
         else:
             shim_path = shim_dir / "ffmpeg"
             shim_path.write_text(f'#!/bin/sh\nexec "{ffmpeg_exe}" "$@"\n', encoding="utf-8")

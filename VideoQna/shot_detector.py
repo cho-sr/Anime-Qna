@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+import time
 from pathlib import Path
 from stat import S_IXGRP, S_IXOTH, S_IXUSR
 
@@ -61,16 +63,22 @@ def create_lowres_proxy(
     target_width += target_width % 2
     target_height += target_height % 2
 
+    print(
+        f"[transnet] creating proxy {original_width}x{original_height} -> "
+        f"{target_width}x{target_height}"
+    )
+    start = time.perf_counter()
+    if _create_lowres_proxy_with_ffmpeg(video_path, output_path, target_width):
+        cap.release()
+        print(f"[transnet] proxy created with ffmpeg in {time.perf_counter() - start:.1f}s")
+        return output_path
+
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(str(output_path), fourcc, fps, (target_width, target_height))
     if not writer.isOpened():
         cap.release()
         raise RuntimeError(f"Cannot create low-resolution proxy: {output_path}")
 
-    print(
-        f"[transnet] creating proxy {original_width}x{original_height} -> "
-        f"{target_width}x{target_height}"
-    )
     with tqdm(total=frame_count or None, desc="proxy", unit="frame") as pbar:
         while True:
             ok, frame = cap.read()
@@ -82,7 +90,64 @@ def create_lowres_proxy(
 
     cap.release()
     writer.release()
+    print(f"[transnet] proxy created with OpenCV in {time.perf_counter() - start:.1f}s")
     return output_path
+
+
+def _create_lowres_proxy_with_ffmpeg(
+    video_path: Path,
+    output_path: Path,
+    target_width: int,
+) -> bool:
+    if not shutil.which("ffmpeg"):
+        return False
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        output_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+    common_args = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        str(video_path),
+        "-map",
+        "0:v:0",
+        "-an",
+        "-sn",
+        "-dn",
+        "-vf",
+        f"scale={target_width}:-2",
+    ]
+    encoder_args = [
+        ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p"],
+        ["-c:v", "mpeg4", "-q:v", "5"],
+    ]
+
+    last_error = ""
+    for encoder in encoder_args:
+        completed = subprocess.run(
+            [*common_args, *encoder, str(output_path)],
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+            return True
+        last_error = (completed.stderr or completed.stdout or "").strip()
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    if last_error:
+        print(f"[warn] ffmpeg proxy failed; falling back to OpenCV: {last_error[-500:]}")
+    return False
 
 
 class TransNetShotDetector:
@@ -214,15 +279,6 @@ class TransNetShotDetector:
         for candidate in local_candidates:
             if candidate.exists():
                 return candidate
-
-        try:
-            import transnetv2_pytorch
-        except ImportError:
-            return None
-
-        package_root = Path(transnetv2_pytorch.__file__).resolve().parent
-        for candidate in package_root.rglob("transnetv2-pytorch-weights.pth"):
-            return candidate
         return None
 
     @staticmethod

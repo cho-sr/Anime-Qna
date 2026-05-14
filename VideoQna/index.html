@@ -351,21 +351,6 @@
           <input id="collection" name="collection" value="video_qna" autocomplete="off">
         </div>
 
-        <div class="grid-3">
-          <div class="field">
-            <label for="topK">Top K</label>
-            <input id="topK" name="topK" type="number" min="1" max="20" value="5">
-          </div>
-          <div class="field">
-            <label for="denseTopK">Dense</label>
-            <input id="denseTopK" name="denseTopK" type="number" min="1" max="100" value="20">
-          </div>
-          <div class="field">
-            <label for="bm25TopK">BM25</label>
-            <input id="bm25TopK" name="bm25TopK" type="number" min="1" max="100" value="20">
-          </div>
-        </div>
-
         <button id="submitButton" class="submit" type="submit">질문하기</button>
       </form>
     </aside>
@@ -534,10 +519,7 @@
 
       const payload = {
         question: document.getElementById("question").value.trim(),
-        collection: document.getElementById("collection").value.trim() || "video_qna",
-        top_k: Number(document.getElementById("topK").value || 5),
-        dense_top_k: Number(document.getElementById("denseTopK").value || 20),
-        bm25_top_k: Number(document.getElementById("bm25TopK").value || 20)
+        collection: document.getElementById("collection").value.trim() || "video_qna"
       };
 
       try {

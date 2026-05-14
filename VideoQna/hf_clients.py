@@ -16,6 +16,8 @@ JSON_RETRY_PROMPT = (
     "object and nothing else. Do not include markdown, comments, or reasoning. /no_think"
 )
 
+NO_REASONING_EXTRA_BODY = {"reasoning": {"enabled": False}}
+
 
 def _content_to_text(content: Any) -> str:
     if content is None:
@@ -74,6 +76,59 @@ def _clip_text(text: str, max_chars: int) -> str:
     return text[: max_chars - 3].rstrip() + "..."
 
 
+def _clip_multiline_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+
+def _unique_str_list(value: Any, limit: int | None = None) -> list[str]:
+    items = ensure_str_list(value)
+    unique = []
+    seen = set()
+    for item in items:
+        key = " ".join(item.split()).casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+        if limit is not None and len(unique) >= limit:
+            break
+    return unique
+
+
+def _clean_search_text(value: Any) -> str:
+    text = ensure_str(value)
+    if not text:
+        return ""
+
+    for label in ["행동:", "인물:", "사물:", "장소:", "화면 키워드:", "대사 키워드:"]:
+        text = text.replace(f" {label}", f"\n{label}")
+
+    empty_values = {
+        "없음",
+        "없다",
+        "없습니다",
+        "해당 없음",
+        "해당없음",
+        "없음.",
+        "[]",
+        "n/a",
+        "none",
+        "null",
+    }
+    lines = []
+    for raw_line in text.splitlines():
+        line = " ".join(raw_line.split())
+        if not line:
+            continue
+        value_part = line.split(":", 1)[1].strip() if ":" in line else line
+        if value_part.casefold() in empty_values:
+            continue
+        lines.append(line)
+    return _clip_multiline_text("\n".join(lines), 1800)
+
+
 class HuggingFaceChatClient:
     def __init__(
         self,
@@ -107,21 +162,42 @@ class HuggingFaceChatClient:
         model: str,
         messages: list[dict[str, Any]],
         max_tokens: int = 800,
+        response_format: dict[str, Any] | None = None,
+        extra_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         active_messages = messages
         content = ""
         parse_error: Exception | None = None
 
         for attempt in range(2):
+            kwargs: dict[str, Any] = {
+                "model": self._router_model(model),
+                "messages": active_messages,
+                "max_tokens": max_tokens,
+                "temperature": 0.0,
+            }
+            if response_format:
+                kwargs["response_format"] = response_format
+            if extra_body:
+                kwargs["extra_body"] = extra_body
+
             try:
-                response = self._create_completion(
-                    model=self._router_model(model),
-                    messages=active_messages,
-                    max_tokens=max_tokens,
-                    temperature=0.0,
-                )
+                response = self._create_completion(**kwargs)
             except Exception as exc:
-                raise RuntimeError(self._format_hf_error(model, exc)) from exc
+                if extra_body and self._is_request_param_error(exc):
+                    print(
+                        "[warn] HF chat rejected no-reasoning request options; "
+                        "retrying without extra_body."
+                    )
+                    kwargs.pop("extra_body", None)
+                    try:
+                        response = self._create_completion(**kwargs)
+                    except Exception as retry_exc:
+                        raise RuntimeError(
+                            self._format_hf_error(model, retry_exc)
+                        ) from retry_exc
+                else:
+                    raise RuntimeError(self._format_hf_error(model, exc)) from exc
 
             content = _message_content(response)
             if not content.strip():
@@ -208,6 +284,21 @@ class HuggingFaceChatClient:
         return any(marker in message for marker in retryable_markers)
 
     @staticmethod
+    def _is_request_param_error(exc: Exception) -> bool:
+        status_code = getattr(exc, "status_code", None)
+        message = str(exc).lower()
+        if status_code == 400 and "invalid_request" in message:
+            return True
+        markers = [
+            "input validation error",
+            "unexpected keyword argument",
+            "unknown parameter",
+            "unsupported parameter",
+            "invalid parameter",
+        ]
+        return any(marker in message for marker in markers)
+
+    @staticmethod
     def _format_hf_error(model: str, exc: Exception) -> str:
         message = str(exc)
         hint = ""
@@ -232,9 +323,11 @@ class VideoVLMClient:
             {
                 "role": "system",
                 "content": (
-                    "You extract visual retrieval metadata from a single video keyframe. "
-                    "Return only valid JSON in Korean. Describe only visible evidence. "
-                    "Do not infer dialogue, names, plot, or unseen context. Do not include reasoning."
+                    "You extract Korean visual retrieval metadata from one video keyframe. "
+                    "Use only visible evidence in the image. Do not infer dialogue, names, "
+                    "plot, relationships, emotions, or unseen context. Prefer concrete "
+                    "searchable nouns and visible actions over mood or interpretation. "
+                    "Return only one valid JSON object. Do not include markdown or reasoning."
                 ),
             },
             {
@@ -247,24 +340,34 @@ class VideoVLMClient:
                     {
                         "type": "text",
                         "text": (
-                            "Create compact metadata that will later be embedded for Korean video search. "
+                            "Create compact metadata for Korean video search. "
                             "Return JSON fields exactly as:\n"
-                            "- frame_description: one Korean sentence about the visible scene\n"
-                            "- visible_objects: array of concrete visible nouns\n"
-                            "- visible_actions: array of visible actions or postures\n"
-                            "- people: array of visible person descriptions, roles, or counts; no names unless visible\n"
+                            "- frame_description: one factual Korean sentence describing the visible scene\n"
+                            "- visible_objects: 3-12 concrete visible nouns, including important background items\n"
+                            "- visible_actions: visible actions, motions, gestures, or postures; [] if none\n"
+                            "- people: visible person counts, roles, clothing, or descriptions; no names unless readable/visible\n"
                             "- setting: short visible place/background description\n"
-                            "- visible_text: array of readable text/OCR seen in the image\n"
-                            "- visual_keywords: array of Korean search keywords and common synonyms from the image\n\n"
-                            "Prefer concrete searchable words over poetic wording. "
-                            "Use [] or empty string when unknown. Return exactly one JSON object and no markdown. /no_think"
+                            "- visible_text: readable text/OCR in the image; [] if none\n"
+                            "- visual_keywords: 8-20 Korean search keywords and common synonyms for visible objects, actions, and setting\n\n"
+                            "Rules:\n"
+                            "- Do not describe sound, dialogue, prior plot, camera intent, or hidden emotions.\n"
+                            "- Use plain Korean words a user might search for.\n"
+                            "- Keep arrays deduplicated and remove vague words unless visually grounded.\n"
+                            "- Use [] or empty string when unknown.\n"
+                            "Return exactly one JSON object and no markdown. /no_think"
                         ),
                     },
                 ],
             },
         ]
         try:
-            data = self.chat.chat_json(self.model, messages, max_tokens=900)
+            data = self.chat.chat_json(
+                self.model,
+                messages,
+                max_tokens=900,
+                response_format={"type": "json_object"},
+                extra_body=NO_REASONING_EXTRA_BODY,
+            )
         except RuntimeError as exc:
             if "Model did not return valid JSON" not in str(exc):
                 raise
@@ -284,12 +387,12 @@ class VideoVLMClient:
             frame_description=ensure_str(
                 data.get("frame_description") or data.get("description")
             ),
-            visible_objects=ensure_str_list(data.get("visible_objects")),
-            visible_actions=ensure_str_list(data.get("visible_actions")),
-            people=ensure_str_list(data.get("people")),
+            visible_objects=_unique_str_list(data.get("visible_objects"), limit=12),
+            visible_actions=_unique_str_list(data.get("visible_actions"), limit=12),
+            people=_unique_str_list(data.get("people"), limit=10),
             setting=ensure_str(data.get("setting")),
-            visible_text=ensure_str_list(data.get("visible_text")),
-            visual_keywords=ensure_str_list(data.get("visual_keywords")),
+            visible_text=_unique_str_list(data.get("visible_text"), limit=12),
+            visual_keywords=_unique_str_list(data.get("visual_keywords"), limit=20),
         )
 
     @staticmethod
@@ -317,38 +420,51 @@ class SummaryLLMClient:
             {
                 "role": "system",
                 "content": (
-                    "You create retrieval-optimized Korean metadata for one video shot. "
-                    "Use the visual evidence and overlapping subtitles only. "
-                    "The output will be embedded as a retrieval document for Qwen3 Embedding, "
-                    "so use concrete Korean nouns, verbs, and likely user query terms. "
-                    "Do not invent facts, names, emotions, or locations that are not supported. "
-                    "Return only valid JSON. Do not include reasoning."
+                    "You write retrieval-optimized Korean metadata for one video shot. "
+                    "Use only the provided keyframe visual metadata and overlapping subtitles. "
+                    "The output will be used for semantic vector search and keyword/BM25 search, "
+                    "so preserve concrete nouns, actions, people, objects, places, and dialogue terms. "
+                    "Do not invent facts, names, emotions, places, relationships, or story context "
+                    "that are not supported by the input. Return only one valid JSON object. "
+                    "Do not include markdown or reasoning."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    "Create a concise searchable scene record. "
+                    "Create a concise but search-rich scene record. "
                     "Return JSON fields exactly as:\n"
-                    "- summary: 1-2 natural Korean sentences combining visual evidence and subtitles\n"
-                    "- action: array of concrete actions/events\n"
-                    "- context: short factual context from subtitles and visible scene\n"
-                    "- emotion: array of supported emotions or tones; [] if unclear\n"
-                    "- people: array of people/roles/descriptions mentioned or visible\n"
-                    "- objects: array of important objects/items\n"
+                    "- summary: 1-2 factual Korean sentences combining visible evidence and subtitles\n"
+                    "- action: array of concrete actions/events as short Korean verb phrases\n"
+                    "- context: short factual context from subtitles and visible scene; empty string if unclear\n"
+                    "- emotion: array of explicitly supported emotions or tones; [] if unclear\n"
+                    "- people: array of visible or mentioned people, roles, names, or descriptions\n"
+                    "- objects: array of important visible or mentioned objects/items\n"
                     "- places: array of visible or mentioned places/settings\n"
-                    "- visual_keywords: array of Korean visual search terms and synonyms\n"
-                    "- dialogue_keywords: array of important spoken/subtitle keywords\n"
-                    "- search_text: 3-6 short Korean lines optimized for semantic retrieval. "
-                    "Include summary, key actions, people/objects/places, visual keywords, and dialogue keywords. "
-                    "Use repeated important terms naturally, but do not stuff unrelated keywords.\n\n"
+                    "- visual_keywords: array of Korean visual search terms and useful synonyms\n"
+                    "- dialogue_keywords: array of important subtitle terms, names, topics, questions, goals, or events\n"
+                    "- search_text: one Korean string with 5-8 short newline-separated lines optimized for retrieval\n\n"
+                    "Search text rules:\n"
+                    "- Use labels like 요약:, 행동:, 인물:, 사물:, 장소:, 화면 키워드:, 대사 키워드: when available.\n"
+                    "- Include the summary first and make every line useful as a standalone search clue.\n"
+                    "- Do not include unavailable categories in search_text; never write 없음/해당 없음 lines.\n"
+                    "- Repeat the most important nouns/verbs naturally 1-2 times, but do not add unrelated keyword spam.\n"
+                    "- Add common Korean synonyms only when they are faithful to the evidence.\n"
+                    "- If subtitles are empty, keep dialogue_keywords as [] and focus search_text on visual evidence.\n"
+                    "- Avoid poetic language; use terms a user would type in a video search question.\n\n"
                     "Return exactly one JSON object and no markdown. /no_think\n\n"
                     f"INPUT_JSON:\n{json.dumps(payload, ensure_ascii=False)}"
                 ),
             },
         ]
         try:
-            data = self.chat.chat_json(self.model, messages, max_tokens=1200)
+            data = self.chat.chat_json(
+                self.model,
+                messages,
+                max_tokens=1200,
+                response_format={"type": "json_object"},
+                extra_body=NO_REASONING_EXTRA_BODY,
+            )
         except RuntimeError as exc:
             if "Model did not return valid JSON" not in str(exc):
                 raise
@@ -358,15 +474,15 @@ class SummaryLLMClient:
 
         summary = SceneSummary(
             summary=ensure_str(data.get("summary")),
-            action=ensure_str_list(data.get("action")),
+            action=_unique_str_list(data.get("action"), limit=12),
             context=ensure_str(data.get("context")),
-            emotion=ensure_str_list(data.get("emotion")),
-            people=ensure_str_list(data.get("people")),
-            objects=ensure_str_list(data.get("objects")),
-            places=ensure_str_list(data.get("places")),
-            visual_keywords=ensure_str_list(data.get("visual_keywords")),
-            dialogue_keywords=ensure_str_list(data.get("dialogue_keywords")),
-            search_text=ensure_str(data.get("search_text")),
+            emotion=_unique_str_list(data.get("emotion"), limit=8),
+            people=_unique_str_list(data.get("people"), limit=15),
+            objects=_unique_str_list(data.get("objects"), limit=20),
+            places=_unique_str_list(data.get("places"), limit=12),
+            visual_keywords=_unique_str_list(data.get("visual_keywords"), limit=25),
+            dialogue_keywords=_unique_str_list(data.get("dialogue_keywords"), limit=25),
+            search_text=_clean_search_text(data.get("search_text")),
         )
         if not summary.summary:
             print("[warn] LLM summary JSON omitted summary; using fallback summary.")
@@ -405,13 +521,13 @@ class SummaryLLMClient:
 
         fallback = SceneSummary(
             summary=_clip_text(summary, 700),
-            action=ensure_str_list(frame_description.visible_actions),
+            action=_unique_str_list(frame_description.visible_actions, limit=12),
             context=_clip_text(" ".join(context_parts), 1000),
             emotion=[],
-            people=ensure_str_list(frame_description.people),
-            objects=ensure_str_list(frame_description.visible_objects),
-            places=ensure_str_list(frame_description.setting),
-            visual_keywords=ensure_str_list(frame_description.visual_keywords),
+            people=_unique_str_list(frame_description.people, limit=15),
+            objects=_unique_str_list(frame_description.visible_objects, limit=20),
+            places=_unique_str_list(frame_description.setting, limit=12),
+            visual_keywords=_unique_str_list(frame_description.visual_keywords, limit=25),
             dialogue_keywords=[],
         )
         fallback.search_text = SummaryLLMClient.search_text_from_summary(
@@ -446,7 +562,7 @@ class SummaryLLMClient:
             f"화면 설명: {frame_description.frame_description}",
             f"자막: {_clip_text(subtitle_text, 500)}" if subtitle_text else "",
         ]
-        return _clip_text("\n".join(part for part in parts if part), 1800)
+        return _clip_multiline_text("\n".join(part for part in parts if part), 1800)
 
 
 class RAGLLMClient:

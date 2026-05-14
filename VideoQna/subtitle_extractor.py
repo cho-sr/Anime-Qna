@@ -14,11 +14,13 @@ class WhisperSubtitleExtractor:
         language: Optional[str] = None,
         device: str = "auto",
         compute_type: str = "auto",
+        vad_filter: bool = False,
     ):
         self.model_size = model_size
         self.language = language
         self.device = device
         self.compute_type = compute_type
+        self.vad_filter = vad_filter
         self._model = None
 
     def _load_model(self):
@@ -49,12 +51,15 @@ class WhisperSubtitleExtractor:
 
         self._load_model()
         print(f"[whisper] transcribing: {video_path}")
-        try:
-            segments, info = self._transcribe_with_vad(video_path, vad_filter=True)
-        except RuntimeError as exc:
-            if "VAD" not in str(exc) and "onnxruntime" not in str(exc).lower():
-                raise
-            print(f"[warn] whisper VAD unavailable; retrying without VAD: {exc}")
+        if self.vad_filter:
+            try:
+                segments, info = self._transcribe_with_vad(video_path, vad_filter=True)
+            except RuntimeError as exc:
+                if "VAD" not in str(exc) and "onnxruntime" not in str(exc).lower():
+                    raise
+                print(f"[warn] whisper VAD unavailable; retrying without VAD: {exc}")
+                segments, info = self._transcribe_with_vad(video_path, vad_filter=False)
+        else:
             segments, info = self._transcribe_with_vad(video_path, vad_filter=False)
 
         subtitles: list[SubtitleSegment] = []

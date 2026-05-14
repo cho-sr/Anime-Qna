@@ -4,6 +4,10 @@ import os
 from pathlib import Path
 
 
+_DLL_DIRECTORY_HANDLES = []
+_ADDED_DLL_DIRS: set[str] = set()
+
+
 def _path_has_dll(name: str) -> bool:
     path_value = os.environ.get("PATH", "")
     for path_item in path_value.split(os.pathsep):
@@ -14,6 +18,61 @@ def _path_has_dll(name: str) -> bool:
                 return True
         except OSError:
             continue
+    return False
+
+
+def _iter_cuda_bin_candidates():
+    seen: set[Path] = set()
+
+    for key, value in os.environ.items():
+        if not key.upper().startswith("CUDA_PATH") or not value:
+            continue
+        path = Path(value)
+        candidates = [path] if path.name.lower() == "bin" else [path / "bin", path]
+        for candidate in candidates:
+            if candidate not in seen:
+                seen.add(candidate)
+                yield candidate
+
+    program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+    roots = [
+        Path(program_files) / "NVIDIA GPU Computing Toolkit" / "CUDA",
+        Path(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA"),
+    ]
+    for root in roots:
+        try:
+            versions = sorted(root.iterdir(), reverse=True)
+        except OSError:
+            continue
+        for version_dir in versions:
+            candidate = version_dir / "bin"
+            if candidate not in seen:
+                seen.add(candidate)
+                yield candidate
+
+
+def _ensure_windows_dll_available(name: str) -> bool:
+    if os.name != "nt":
+        return True
+    if _path_has_dll(name):
+        return True
+
+    for candidate in _iter_cuda_bin_candidates():
+        try:
+            if not (candidate / name).exists():
+                continue
+        except OSError:
+            continue
+
+        candidate_text = str(candidate)
+        if candidate_text not in _ADDED_DLL_DIRS:
+            os.environ["PATH"] = candidate_text + os.pathsep + os.environ.get("PATH", "")
+            if hasattr(os, "add_dll_directory"):
+                _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(candidate_text))
+            _ADDED_DLL_DIRS.add(candidate_text)
+            print(f"[device] whisper: added CUDA DLL path {candidate_text}")
+        return True
+
     return False
 
 
@@ -49,9 +108,7 @@ def ctranslate2_cuda_is_available() -> bool:
 def whisper_cuda_runtime_is_available() -> bool:
     if not ctranslate2_cuda_is_available():
         return False
-    if os.name != "nt":
-        return True
-    return _path_has_dll("cudnn_ops_infer64_8.dll")
+    return _ensure_windows_dll_available("cudnn_ops_infer64_8.dll")
 
 
 def ctranslate2_supported_compute_types(device: str) -> set[str]:

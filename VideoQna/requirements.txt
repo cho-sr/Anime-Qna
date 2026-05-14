@@ -11,6 +11,8 @@ imageio-ffmpeg>=0.4.9
 torch==2.5.1+cu121
 sympy==1.13.1
 huggingface-hub>=0.34.0
+transformers>=4.51.0
+safetensors>=0.4.0
 openai>=1.0.0
 qdrant-client>=1.9.0
 Pillow>=10.0.0

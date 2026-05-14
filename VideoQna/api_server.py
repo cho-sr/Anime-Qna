@@ -36,10 +36,6 @@ def default_qdrant_path() -> Path:
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
     collection: str = "video_qna"
-    top_k: int = Field(default=5, ge=1, le=20)
-    dense_top_k: int = Field(default=20, ge=1, le=100)
-    bm25_top_k: int = Field(default=20, ge=1, le=100)
-    dense_workers: int = Field(default=3, ge=1, le=8)
 
 
 class Source(BaseModel):
@@ -132,12 +128,7 @@ async def ask(req: AskRequest):
         result = engine.ask(
             question=req.question,
             collection=req.collection,
-            config=RetrievalConfig(
-                top_k=req.top_k,
-                dense_top_k=req.dense_top_k,
-                bm25_top_k=req.bm25_top_k,
-                dense_workers=req.dense_workers,
-            ),
+            config=RetrievalConfig(),
         )
         return result
     except ValueError as exc:

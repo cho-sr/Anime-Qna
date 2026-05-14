@@ -32,9 +32,11 @@ python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_
 
 On Windows, faster-whisper through CTranslate2 also needs cuDNN 8 DLLs for
 Whisper CUDA execution. If CTranslate2 sees the GPU but `cudnn_ops_infer64_8.dll`
-is not on `PATH`, VideoQna falls back to CPU for Whisper while keeping PyTorch
-CUDA available for TransNetV2. If ONNX Runtime is unavailable, Whisper retries
-without the optional VAD filter.
+is not on `PATH`, VideoQna tries the installed CUDA Toolkit `bin` directories
+before falling back to CPU for Whisper. The optional faster-whisper VAD filter
+imports ONNX Runtime, which can be brittle on some Windows CUDA installs, so it
+is disabled by default. Add `--whisper-vad` only after ONNX Runtime imports
+cleanly in your environment.
 
 Edit `.env` and set `HF_TOKEN`. The same token is used for VLM, LLM, and embedding API calls.
 Chat/VLM calls use the Hugging Face Router's OpenAI-compatible API. You can
@@ -47,19 +49,27 @@ HF_VLM_MODEL=Qwen/Qwen3.5-9B
 HF_VLM_PROVIDER=together
 ```
 
-Embedding calls use Hugging Face feature extraction through `huggingface_hub`.
-The default `.env.example` uses Qwen3 Embedding through a provider/model pair
-that supports feature extraction:
+By default, embeddings run locally with Qwen3-Embedding-0.6B. The first run
+downloads the model into the Hugging Face cache, then reuses it for indexing and
+RAG queries:
 
 ```env
-HF_EMBEDDING_PROVIDER=scaleway
-HF_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-8B
+EMBEDDING_BACKEND=local
+LOCAL_EMBEDDING_MODEL=Qwen/Qwen3-Embedding-0.6B
+LOCAL_EMBEDDING_DEVICE=auto
 ```
 
 For Qwen3 embedding models, query embeddings are formatted with an English
 retrieval instruction, while stored scene documents are embedded without an
 instruction. This follows the Qwen3 embedding model card guidance for
 instruction-aware retrieval.
+
+To use a hosted embedding API instead, set `EMBEDDING_BACKEND=api` and configure
+`HF_EMBEDDING_MODEL` plus `HF_EMBEDDING_PROVIDER`.
+
+Changing embedding models changes vector dimensions. Qwen3-Embedding-0.6B writes
+1024-dimensional vectors, while Qwen3-Embedding-8B writes 4096-dimensional
+vectors, so use a fresh Qdrant collection or clear the old one when switching.
 
 TransNetV2 uses the system `ffmpeg` executable when available. If it is missing,
 VideoQna falls back to the `imageio-ffmpeg` binary installed by `requirements.txt`.
@@ -84,8 +94,8 @@ python pipeline.py index \
   --video /path/to/video.mp4 \
   --collection video_qna \
   --whisper-model base \
-  --whisper-device auto \
-  --whisper-compute-type auto \
+  --whisper-device cuda \
+  --whisper-compute-type int8 \
   --language ko \
   --transnet-threshold 0.5 \
   --transnet-device auto \
@@ -93,21 +103,37 @@ python pipeline.py index \
   --proxy-width 320 \
   --keyframe-workers 1 \
   --api-workers 3 \
+  --api-mode stage \
+  --embedding-backend local \
+  --local-embedding-model Qwen/Qwen3-Embedding-0.6B \
   --qdrant-batch-size 16 \
   --candidate-stride 0.5
 ```
 
-With the default `auto` device setting, Whisper and TransNetV2 prefer CUDA and
-fall back to CPU when CUDA is unavailable. To require CUDA explicitly, pass
-`--whisper-device cuda --transnet-device cuda`.
+By default, Whisper runs on CUDA with `int8` compute type. TransNetV2 keeps the
+`auto` device setting and prefers CUDA when PyTorch can see the GPU.
+Add `--whisper-vad` if you want faster-whisper's optional silence filtering and
+your ONNX Runtime install is stable.
 
 With `--keyframe-workers 1`, keyframes are extracted with a single-pass sampler:
 the video is scanned in timestamp order to avoid repeated random seeks. Values
 above `1` use parallel per-shot seeking, which can be faster on some SSDs but
-may be slower for long compressed videos. `--api-workers` runs the per-shot VLM,
-LLM summary, and embedding chain concurrently. `--qdrant-batch-size` controls
-how many completed shots are written per Qdrant upsert batch. Parallel API calls
-reduce wall-clock waiting time but do not reduce the number of remote requests.
+may be slower for long compressed videos.
+
+The default `--api-mode stage` overlaps separate VLM, LLM, and embedding pools:
+VLM descriptions are submitted first, LLM summaries start as soon as each VLM
+result is ready, and embeddings/Qdrant writes follow completed summaries.
+`--api-workers` sets the default pool size for remote stages; use `--vlm-workers`
+or `--llm-workers` to tune them separately. Local embeddings are shared across
+workers so the model is loaded once, and the embedding stage is forced to one
+worker to avoid loading duplicate CUDA models. Completed summaries are
+accumulated up to `LOCAL_EMBEDDING_BATCH_SIZE` before local embedding inference,
+so logs should show `batch=8` when enough summaries are ready. `--api-mode shot`
+keeps the old per-shot `VLM -> LLM -> embedding` worker behavior.
+
+`--qdrant-batch-size` controls how many completed shots are written per Qdrant
+upsert batch. Parallel API calls reduce wall-clock waiting time but do not
+reduce the number of remote VLM/LLM requests.
 Completed per-shot API results are also checkpointed to `api_results.jsonl`
 before Qdrant writes, so `--resume-run` can avoid repeating successful remote
 calls after an interruption.
@@ -119,8 +145,8 @@ data/runs/<run_id>/timings.json
 ```
 
 If `--transnet-weights` is omitted, the pipeline checks `TRANSNET_WEIGHTS`,
-the current directory, the `VideoQna/` directory, and finally any weights bundled
-inside the installed `transnetv2_pytorch` package.
+the current directory, and the `VideoQna/` directory. Otherwise it uses the
+default weights loaded by the installed `transnetv2_pytorch` package.
 
 ## Stats
 
@@ -160,7 +186,7 @@ curl -X POST http://localhost:8000/ask \
 The server performs:
 
 1. Qwen LLM query expansion.
-2. Parallel dense retrieval with the configured embedding API against Qdrant vectors.
+2. Parallel dense retrieval with the configured embedder against Qdrant vectors.
 3. Contextual BM25 over stored JSON payload fields. Payloads and the BM25 index
    are cached per collection while the point count is unchanged.
 4. RRF fusion of dense and BM25 rankings.
@@ -176,4 +202,4 @@ Qdrant stores the vector for `summary` only. The payload also keeps:
 - `summary`, `action`, `context`, `emotion`
 - `people`, `objects`, `places`, `visual_keywords`, `dialogue_keywords`
 - `search_text` used as the embedding document text
-- `vlm_model`, `llm_model`, `embedding_model`
+- `vlm_model`, `llm_model`, `embedding_model`, `embedding_backend`

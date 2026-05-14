@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import os
+import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -22,9 +24,17 @@ class IndexTimer:
         self.started_at = time.perf_counter()
         self.steps: list[dict] = []
 
+    @staticmethod
+    def format_duration(seconds: float) -> str:
+        seconds = max(0.0, float(seconds))
+        whole_seconds = int(round(seconds))
+        hours, remainder = divmod(whole_seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
     @contextmanager
     def step(self, name: str, **metadata):
-        print(f"[time] start {name}")
+        print(f"[time] start {name}", flush=True)
         start = time.perf_counter()
         status = "ok"
         error = None
@@ -39,20 +49,23 @@ class IndexTimer:
             record = {
                 "name": name,
                 "elapsed_sec": round(elapsed, 3),
+                "elapsed_hms": self.format_duration(elapsed),
                 "status": status,
                 **metadata,
             }
             if error:
                 record["error"] = error
             self.steps.append(record)
-            print(f"[time] {name}: {elapsed:.2f}s ({status})")
+            print(f"[time] {name}: {elapsed:.2f}s ({status})", flush=True)
 
     def total_sec(self) -> float:
         return time.perf_counter() - self.started_at
 
     def to_dict(self) -> dict:
+        total = self.total_sec()
         return {
-            "total_elapsed_sec": round(self.total_sec(), 3),
+            "total_elapsed_sec": round(total, 3),
+            "total_elapsed_hms": self.format_duration(total),
             "steps": self.steps,
         }
 
@@ -104,7 +117,7 @@ def record_sort_key(record: dict) -> tuple[int, int]:
 def cmd_index(args: argparse.Namespace) -> None:
     from tqdm import tqdm
 
-    from embedding import QwenSummaryEmbedder
+    from embedding import DEFAULT_LOCAL_EMBEDDING_MODEL, create_summary_embedder
     from hf_clients import SummaryLLMClient, VideoVLMClient
     from keyframe_selector import (
         select_keyframe_for_shot,
@@ -140,12 +153,14 @@ def cmd_index(args: argparse.Namespace) -> None:
         run_id = f"{safe_stem(str(video_path))}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         run_dir = data_dir / "runs" / run_id
     keyframe_dir = data_dir / "keyframes" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     timer = IndexTimer()
     print(f"[index] video={video_path}")
     print(f"[index] run_dir={run_dir}")
 
     store = None
+    whisper_extractor = None
     try:
         with timer.step("qdrant_setup", qdrant_path=str(qdrant_path)):
             store = QdrantSummaryStore(qdrant_path=qdrant_path)
@@ -158,13 +173,17 @@ def cmd_index(args: argparse.Namespace) -> None:
                 subtitles = [SubtitleSegment(**item) for item in read_json(subtitles_path)]
         else:
             with timer.step("whisper", model=args.whisper_model, device=args.whisper_device):
-                subtitles = WhisperSubtitleExtractor(
+                whisper_extractor = WhisperSubtitleExtractor(
                     model_size=args.whisper_model,
                     language=args.language,
                     device=args.whisper_device,
                     compute_type=args.whisper_compute_type,
-                ).transcribe(video_path)
+                    vad_filter=args.whisper_vad,
+                )
+                subtitles = whisper_extractor.transcribe(video_path)
+                print(f"[index] saving subtitles={subtitles_path}", flush=True)
                 write_json(subtitles_path, [segment.to_dict() for segment in subtitles])
+                print(f"[index] saved subtitles: {len(subtitles)} segments", flush=True)
 
         if args.resume_run and shots_path.exists():
             with timer.step("load_shots", source=str(shots_path)):
@@ -187,10 +206,26 @@ def cmd_index(args: argparse.Namespace) -> None:
         hf_provider = os.getenv("HF_PROVIDER") or None
         vlm_provider = os.getenv("HF_VLM_PROVIDER") or hf_provider
         llm_provider = os.getenv("HF_LLM_PROVIDER") or hf_provider
+        embedding_backend = (os.getenv("EMBEDDING_BACKEND") or args.embedding_backend).strip().lower()
         embedding_provider = os.getenv("HF_EMBEDDING_PROVIDER") or hf_provider
         vlm_model = os.getenv("HF_VLM_MODEL", args.vlm_model)
         llm_model = os.getenv("HF_LLM_MODEL", args.llm_model)
-        embedding_model = os.getenv("HF_EMBEDDING_MODEL", args.embedding_model)
+        if embedding_backend == "local":
+            embedding_model = os.getenv(
+                "LOCAL_EMBEDDING_MODEL",
+                args.local_embedding_model or DEFAULT_LOCAL_EMBEDDING_MODEL,
+            )
+            embedding_provider = "local"
+        else:
+            embedding_model = os.getenv("HF_EMBEDDING_MODEL", args.embedding_model)
+        local_embedding_device = os.getenv("LOCAL_EMBEDDING_DEVICE", args.local_embedding_device)
+        local_embedding_batch_size = max(
+            1,
+            int(os.getenv("LOCAL_EMBEDDING_BATCH_SIZE", args.local_embedding_batch_size)),
+        )
+        local_embedding_max_length = int(
+            os.getenv("LOCAL_EMBEDDING_MAX_LENGTH", args.local_embedding_max_length)
+        )
 
         effective_llm_model = "skipped" if args.skip_llm_summary else llm_model
         with timer.step(
@@ -198,15 +233,20 @@ def cmd_index(args: argparse.Namespace) -> None:
             vlm_model=vlm_model,
             llm_model=effective_llm_model,
             embedding_model=embedding_model,
+            embedding_backend=embedding_backend,
         ):
             vlm = VideoVLMClient(token=hf_token, model=vlm_model, provider=vlm_provider)
             llm = None
             if not args.skip_llm_summary:
                 llm = SummaryLLMClient(token=hf_token, model=llm_model, provider=llm_provider)
-            embedder = QwenSummaryEmbedder(
+            embedder = create_summary_embedder(
+                backend=embedding_backend,
                 model_name=embedding_model,
                 token=hf_token,
                 provider=embedding_provider,
+                local_device=local_embedding_device,
+                local_batch_size=local_embedding_batch_size,
+                local_max_length=local_embedding_max_length,
             )
 
         records_path = run_dir / "indexed_scenes.json"
@@ -268,6 +308,11 @@ def cmd_index(args: argparse.Namespace) -> None:
 
         keyframe_workers = worker_count(args.keyframe_workers)
         api_workers = worker_count(args.api_workers)
+        vlm_workers = worker_count(args.vlm_workers or api_workers)
+        llm_workers = worker_count(args.llm_workers or api_workers)
+        embedding_workers = worker_count(args.embedding_workers or api_workers)
+        if getattr(embedder, "is_local", False):
+            embedding_workers = 1
         qdrant_batch_size = worker_count(args.qdrant_batch_size)
         pending_shots = []
         for shot in shots:
@@ -346,14 +391,73 @@ def cmd_index(args: argparse.Namespace) -> None:
                         model=llm_model,
                         provider=llm_provider,
                     )
-                worker_embedder = QwenSummaryEmbedder(
-                    model_name=embedding_model,
-                    token=hf_token,
-                    provider=embedding_provider,
-                )
+                if getattr(embedder, "is_local", False):
+                    worker_embedder = embedder
+                else:
+                    worker_embedder = create_summary_embedder(
+                        backend=embedding_backend,
+                        model_name=embedding_model,
+                        token=hf_token,
+                        provider=embedding_provider,
+                        local_device=local_embedding_device,
+                        local_batch_size=local_embedding_batch_size,
+                        local_max_length=local_embedding_max_length,
+                    )
                 clients = (worker_vlm, worker_llm, worker_embedder)
                 worker_state.clients = clients
             return clients
+
+        vlm_worker_state = local()
+        llm_worker_state = local()
+        embedding_worker_state = local()
+
+        def get_vlm_client():
+            if vlm_workers == 1:
+                return vlm
+
+            client = getattr(vlm_worker_state, "client", None)
+            if client is None:
+                client = VideoVLMClient(
+                    token=hf_token,
+                    model=vlm_model,
+                    provider=vlm_provider,
+                )
+                vlm_worker_state.client = client
+            return client
+
+        def get_llm_client():
+            if args.skip_llm_summary:
+                return None
+            if llm_workers == 1:
+                return llm
+
+            client = getattr(llm_worker_state, "client", None)
+            if client is None:
+                client = SummaryLLMClient(
+                    token=hf_token,
+                    model=llm_model,
+                    provider=llm_provider,
+                )
+                llm_worker_state.client = client
+            return client
+
+        def get_embedding_client():
+            if getattr(embedder, "is_local", False) or embedding_workers == 1:
+                return embedder
+
+            client = getattr(embedding_worker_state, "client", None)
+            if client is None:
+                client = create_summary_embedder(
+                    backend=embedding_backend,
+                    model_name=embedding_model,
+                    token=hf_token,
+                    provider=embedding_provider,
+                    local_device=local_embedding_device,
+                    local_batch_size=local_embedding_batch_size,
+                    local_max_length=local_embedding_max_length,
+                )
+                embedding_worker_state.client = client
+            return client
 
         def process_scene_api(scene):
             shot = scene["shot"]
@@ -383,6 +487,127 @@ def cmd_index(args: argparse.Namespace) -> None:
                 "vector": vector,
             }
 
+        def process_vlm_stage(scene):
+            frame_description = get_vlm_client().describe_keyframe(scene["keyframe"].image_path)
+            return {
+                "shot": scene["shot"],
+                "keyframe": scene["keyframe"],
+                "shot_subtitles": scene["shot_subtitles"],
+                "frame_description": frame_description,
+            }
+
+        def process_llm_stage(vlm_result):
+            frame_description = vlm_result["frame_description"]
+            shot_subtitles = vlm_result["shot_subtitles"]
+            if args.skip_llm_summary:
+                summary = SummaryLLMClient.fallback_summary(
+                    frame_description,
+                    shot_subtitles,
+                )
+            else:
+                scene_llm = get_llm_client()
+                if scene_llm is None:
+                    raise RuntimeError("LLM client is not initialized.")
+                summary = scene_llm.summarize_scene(frame_description, shot_subtitles)
+            return {
+                **vlm_result,
+                "summary": summary,
+            }
+
+        def process_embedding_stage(summary_result):
+            embedding_text = summary_result["summary"].search_text or summary_result["summary"].summary
+            vector = get_embedding_client().embed_document(embedding_text)
+            return {
+                **summary_result,
+                "vector": vector,
+            }
+
+        def process_embedding_batch_stage(summary_results):
+            scene_embedder = get_embedding_client()
+            texts = [
+                result["summary"].search_text or result["summary"].summary
+                for result in summary_results
+            ]
+            embed_texts = getattr(scene_embedder, "embed_texts", None)
+            if callable(embed_texts):
+                vectors = embed_texts(texts)
+            else:
+                vectors = [scene_embedder.embed_document(text) for text in texts]
+            if len(vectors) != len(summary_results):
+                raise RuntimeError(
+                    f"Embedding batch returned {len(vectors)} vectors for "
+                    f"{len(summary_results)} texts."
+                )
+            return [
+                {
+                    **result,
+                    "vector": vector,
+                }
+                for result, vector in zip(summary_results, vectors)
+            ]
+
+        def process_stage_pipeline(scenes, progress) -> None:
+            embedding_batch_size = (
+                local_embedding_batch_size
+                if getattr(embedder, "is_local", False)
+                else 1
+            )
+            print(
+                "[api] stage pipeline "
+                f"vlm_workers={vlm_workers} llm_workers={llm_workers} "
+                f"embedding_workers={embedding_workers} "
+                f"embedding_batch_size={embedding_batch_size}",
+                flush=True,
+            )
+            with (
+                ThreadPoolExecutor(max_workers=vlm_workers) as vlm_executor,
+                ThreadPoolExecutor(max_workers=llm_workers) as llm_executor,
+                ThreadPoolExecutor(max_workers=embedding_workers) as embedding_executor,
+            ):
+                active = {}
+                pending_embedding = []
+
+                def submit_embedding_batch(*, force: bool = False) -> None:
+                    nonlocal pending_embedding
+                    while pending_embedding and (
+                        force or len(pending_embedding) >= embedding_batch_size
+                    ):
+                        if force:
+                            batch = list(pending_embedding)
+                            pending_embedding.clear()
+                        else:
+                            batch = pending_embedding[:embedding_batch_size]
+                            del pending_embedding[:embedding_batch_size]
+                        active[
+                            embedding_executor.submit(
+                                process_embedding_batch_stage,
+                                batch,
+                            )
+                        ] = "embedding_batch"
+
+                for scene in scenes:
+                    active[vlm_executor.submit(process_vlm_stage, scene)] = "vlm"
+
+                while active or pending_embedding:
+                    if pending_embedding and not any(
+                        stage in {"vlm", "llm"} for stage in active.values()
+                    ):
+                        submit_embedding_batch(force=True)
+
+                    done, _pending = wait(active, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        stage = active.pop(future)
+                        result = future.result()
+                        if stage == "vlm":
+                            active[llm_executor.submit(process_llm_stage, result)] = "llm"
+                        elif stage == "llm":
+                            pending_embedding.append(result)
+                            submit_embedding_batch()
+                        else:
+                            for item in result:
+                                queue_scene_result(item)
+                            progress.update(len(result))
+
         def scene_payload(result):
             shot = result["shot"]
             keyframe = result["keyframe"]
@@ -411,6 +636,7 @@ def cmd_index(args: argparse.Namespace) -> None:
                 "vlm_model": vlm_model,
                 "llm_model": llm_model,
                 "embedding_model": embedding_model,
+                "embedding_backend": embedding_backend,
             }
 
         def scene_record(point_id: str, result):
@@ -474,13 +700,25 @@ def cmd_index(args: argparse.Namespace) -> None:
                 "shot_api",
                 shots=len(prepared_scenes),
                 workers=api_workers,
+                api_mode=args.api_mode,
+                vlm_workers=vlm_workers,
+                llm_workers=llm_workers,
+                embedding_workers=embedding_workers,
                 vlm_model=vlm_model,
                 llm_model=effective_llm_model,
                 embedding_model=embedding_model,
+                embedding_backend=embedding_backend,
                 qdrant_batch_size=qdrant_batch_size,
             ):
                 try:
-                    if api_workers == 1:
+                    if args.api_mode == "stage":
+                        with tqdm(
+                            total=len(prepared_scenes),
+                            desc="api",
+                            unit="shot",
+                        ) as progress:
+                            process_stage_pipeline(prepared_scenes, progress)
+                    elif api_workers == 1:
                         for scene in tqdm(prepared_scenes, desc="api", unit="shot"):
                             queue_scene_result(process_scene_api(scene))
                     else:
@@ -504,11 +742,16 @@ def cmd_index(args: argparse.Namespace) -> None:
         print(f"[index] done: {len(records)} shots indexed into collection={args.collection}")
         print(f"[index] artifacts={run_dir}")
     finally:
-        write_json(run_dir / "timings.json", timer.to_dict())
+        timing_data = timer.to_dict()
+        write_json(run_dir / "timings.json", timing_data)
         if store is not None:
             store.close()
-        print(f"[time] total: {timer.total_sec():.2f}s")
-        print(f"[time] timings={run_dir / 'timings.json'}")
+        print(
+            "[time] TOTAL elapsed="
+            f"{timing_data['total_elapsed_hms']} ({timing_data['total_elapsed_sec']:.2f}s)",
+            flush=True,
+        )
+        print(f"[time] timings={run_dir / 'timings.json'}", flush=True)
 
 
 def cmd_stats(args: argparse.Namespace) -> None:
@@ -546,6 +789,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Parallel workers for per-shot VLM, LLM, and embedding API calls",
     )
     p_index.add_argument(
+        "--api-mode",
+        default="stage",
+        choices=["stage", "shot"],
+        help="shot runs VLM->LLM->embedding per worker; stage overlaps VLM, LLM, and embedding pools",
+    )
+    p_index.add_argument("--vlm-workers", type=int, default=None, help="VLM stage workers; defaults to --api-workers")
+    p_index.add_argument("--llm-workers", type=int, default=None, help="LLM stage workers; defaults to --api-workers")
+    p_index.add_argument(
+        "--embedding-workers",
+        type=int,
+        default=None,
+        help="Embedding stage workers; defaults to --api-workers, forced to 1 for local embeddings",
+    )
+    p_index.add_argument(
         "--qdrant-batch-size",
         type=int,
         default=16,
@@ -555,11 +812,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_index.add_argument("--whisper-model", default="base", help="faster-whisper model size")
     p_index.add_argument("--language", default=None, help="Whisper language code, e.g. ko/ja/en")
-    p_index.add_argument("--whisper-device", default="auto", help="Whisper device: auto/cuda/cpu")
+    p_index.add_argument("--whisper-device", default="cuda", help="Whisper device: auto/cuda/cpu")
     p_index.add_argument(
         "--whisper-compute-type",
-        default="auto",
-        help="Whisper compute type: auto uses float16 on CUDA and int8 on CPU",
+        default="int8",
+        help="Whisper compute type, e.g. int8/int8_float32/float32/auto",
+    )
+    p_index.add_argument(
+        "--whisper-vad",
+        action="store_true",
+        help="Enable faster-whisper's optional VAD filter. Disabled by default because it imports ONNX Runtime.",
     )
 
     p_index.add_argument("--transnet-threshold", type=float, default=0.5)
@@ -577,6 +839,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--vlm-model", default="Qwen/Qwen3.5-9B:together")
     p_index.add_argument("--llm-model", default="Qwen/Qwen3-8B")
     p_index.add_argument("--embedding-model", default="ibm-granite/granite-embedding-97m-multilingual-r2")
+    p_index.add_argument("--embedding-backend", default="local", choices=["local", "api"])
+    p_index.add_argument("--local-embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
+    p_index.add_argument("--local-embedding-device", default="auto", help="Local embedding device: auto/cuda/cpu")
+    p_index.add_argument("--local-embedding-batch-size", type=int, default=8)
+    p_index.add_argument("--local-embedding-max-length", type=int, default=2048)
     p_index.set_defaults(func=cmd_index)
 
     p_stats = subparsers.add_parser("stats", help="Show Qdrant collection stats")
@@ -588,9 +855,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    faulthandler.enable()
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(line_buffering=True)
     parser = build_parser()
     args = parser.parse_args()
     args.func(args)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    if os.name == "nt" and args.func is cmd_index:
+        os._exit(0)
 
 
 if __name__ == "__main__":

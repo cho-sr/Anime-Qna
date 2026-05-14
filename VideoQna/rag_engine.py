@@ -8,7 +8,11 @@ from threading import local
 from typing import Any
 
 from bm25 import BM25Index
-from embedding import QwenSummaryEmbedder
+from embedding import (
+    DEFAULT_LOCAL_EMBEDDING_MODEL,
+    QwenSummaryEmbedder,
+    create_summary_embedder,
+)
 from hf_clients import RAGLLMClient
 from utils import ensure_str, ensure_str_list, seconds_to_timestamp
 from vector_store import QdrantSummaryStore
@@ -16,9 +20,9 @@ from vector_store import QdrantSummaryStore
 
 @dataclass
 class RetrievalConfig:
-    top_k: int = 5
-    dense_top_k: int = 20
-    bm25_top_k: int = 20
+    top_k: int = 6
+    dense_top_k: int = 40
+    bm25_top_k: int = 60
     rrf_k: int = 60
     dense_workers: int = 3
 
@@ -107,22 +111,34 @@ class HybridRAGEngine:
         hf_token: str,
         llm_model: str,
         embedding_model: str,
+        embedding_backend: str = "local",
         hf_provider: str | None = None,
         llm_provider: str | None = None,
         embedding_provider: str | None = None,
+        local_embedding_device: str = "auto",
+        local_embedding_batch_size: int = 8,
+        local_embedding_max_length: int = 2048,
         store: QdrantSummaryStore | None = None,
     ):
         if not hf_token:
-            raise RuntimeError("HF_TOKEN is required for RAG query expansion, embedding, and answers.")
+            raise RuntimeError("HF_TOKEN is required for RAG query expansion and answers.")
 
         self.hf_token = hf_token
         self.embedding_model = embedding_model
-        self.embedding_provider = embedding_provider or hf_provider
+        self.embedding_backend = (embedding_backend or "local").strip().lower()
+        self.embedding_provider = "local" if self.embedding_backend == "local" else embedding_provider or hf_provider
+        self.local_embedding_device = local_embedding_device
+        self.local_embedding_batch_size = int(local_embedding_batch_size or 8)
+        self.local_embedding_max_length = int(local_embedding_max_length or 2048)
         self.store = store or QdrantSummaryStore(qdrant_path=qdrant_path)
-        self.embedder = QwenSummaryEmbedder(
+        self.embedder = create_summary_embedder(
+            backend=self.embedding_backend,
             model_name=embedding_model,
             token=hf_token,
             provider=self.embedding_provider,
+            local_device=self.local_embedding_device,
+            local_batch_size=self.local_embedding_batch_size,
+            local_max_length=self.local_embedding_max_length,
         )
         self.llm = RAGLLMClient(token=hf_token, model=llm_model, provider=llm_provider or hf_provider)
         self._collection_cache: dict[str, dict[str, Any]] = {}
@@ -134,25 +150,40 @@ class HybridRAGEngine:
         store: QdrantSummaryStore | None = None,
     ) -> "HybridRAGEngine":
         hf_provider = os.getenv("HF_PROVIDER") or None
+        embedding_backend = (os.getenv("EMBEDDING_BACKEND") or "local").strip().lower()
+        if embedding_backend == "local":
+            embedding_model = os.getenv("LOCAL_EMBEDDING_MODEL", DEFAULT_LOCAL_EMBEDDING_MODEL)
+            embedding_provider = "local"
+        else:
+            embedding_model = os.getenv(
+                "HF_EMBEDDING_MODEL",
+                "ibm-granite/granite-embedding-97m-multilingual-r2",
+            )
+            embedding_provider = os.getenv("HF_EMBEDDING_PROVIDER") or hf_provider
         return cls(
             qdrant_path=qdrant_path,
             hf_token=os.getenv("HF_TOKEN", ""),
             hf_provider=hf_provider,
             llm_provider=os.getenv("HF_LLM_PROVIDER") or hf_provider,
-            embedding_provider=os.getenv("HF_EMBEDDING_PROVIDER") or hf_provider,
+            embedding_provider=embedding_provider,
             llm_model=os.getenv("HF_LLM_MODEL", "Qwen/Qwen3-8B"),
-            embedding_model=os.getenv(
-                "HF_EMBEDDING_MODEL",
-                "ibm-granite/granite-embedding-97m-multilingual-r2",
-            ),
+            embedding_model=embedding_model,
+            embedding_backend=embedding_backend,
+            local_embedding_device=os.getenv("LOCAL_EMBEDDING_DEVICE", "auto"),
+            local_embedding_batch_size=int(os.getenv("LOCAL_EMBEDDING_BATCH_SIZE", "8")),
+            local_embedding_max_length=int(os.getenv("LOCAL_EMBEDDING_MAX_LENGTH", "2048")),
             store=store,
         )
 
     def _new_embedder(self) -> QwenSummaryEmbedder:
-        return QwenSummaryEmbedder(
+        return create_summary_embedder(
+            backend=self.embedding_backend,
             model_name=self.embedding_model,
             token=self.hf_token,
             provider=self.embedding_provider,
+            local_device=self.local_embedding_device,
+            local_batch_size=self.local_embedding_batch_size,
+            local_max_length=self.local_embedding_max_length,
         )
 
     def ask(self, question: str, collection: str, config: RetrievalConfig) -> dict[str, Any]:
@@ -240,6 +271,13 @@ class HybridRAGEngine:
             "sources": sources,
             "retrieval_debug": {
                 "collection_exists": True,
+                "config": {
+                    "top_k": config.top_k,
+                    "dense_top_k": config.dense_top_k,
+                    "bm25_top_k": config.bm25_top_k,
+                    "rrf_k": config.rrf_k,
+                    "dense_workers": config.dense_workers,
+                },
                 "dense_results": [
                     {
                         "query": item["query"],
@@ -281,6 +319,8 @@ class HybridRAGEngine:
         def embed_queries() -> list[tuple[str, list[float]]]:
             ordered_vectors: list[tuple[str, list[float]] | None] = [None] * len(queries)
             workers_count = max(1, int(workers or 1))
+            if getattr(self.embedder, "is_local", False):
+                workers_count = 1
             if workers_count == 1 or len(queries) <= 1:
                 for index, query in enumerate(queries):
                     ordered_vectors[index] = (query, self.embedder.embed_query(query))

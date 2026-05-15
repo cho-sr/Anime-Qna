@@ -195,7 +195,8 @@ class LocalQwenSummaryEmbedder:
         except ImportError as exc:
             raise RuntimeError(
                 "Local embeddings require torch and transformers. "
-                "Install VideoQna/requirements.txt first."
+                "Run `python -m pip install -r requirements.txt`, or set "
+                "EMBEDDING_BACKEND=api to use the hosted embedding API."
             ) from exc
 
         dtype = torch.float16 if self.device_name == "cuda" else torch.float32
@@ -227,6 +228,7 @@ class LocalQwenSummaryEmbedder:
             )
         self.model.to(self.device_name)
         self.model.eval()
+        self.vector_size = int(getattr(self.model.config, "hidden_size", 0) or 0) or None
 
     def embed_summary(self, summary: str) -> list[float]:
         return self.embed_document(summary)

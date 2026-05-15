@@ -323,11 +323,11 @@ class VideoVLMClient:
             {
                 "role": "system",
                 "content": (
-                    "You extract Korean visual retrieval metadata from one video keyframe. "
+                    "You describe one video keyframe for Korean video retrieval. "
                     "Use only visible evidence in the image. Do not infer dialogue, names, "
-                    "plot, relationships, emotions, or unseen context. Prefer concrete "
-                    "searchable nouns and visible actions over mood or interpretation. "
-                    "Return only one valid JSON object. Do not include markdown or reasoning."
+                    "plot, relationships, emotions, or unseen context. Prefer concrete visible "
+                    "objects, people, settings, text, posture, and actions over interpretation. "
+                    "Return plain Korean text only. Do not return JSON, markdown, or reasoning."
                 ),
             },
             {
@@ -340,39 +340,26 @@ class VideoVLMClient:
                     {
                         "type": "text",
                         "text": (
-                            "Create compact metadata for Korean video search. "
-                            "Return JSON fields exactly as:\n"
-                            "- frame_description: one factual Korean sentence describing the visible scene\n"
-                            "- visible_objects: 3-12 concrete visible nouns, including important background items\n"
-                            "- visible_actions: visible actions, motions, gestures, or postures; [] if none\n"
-                            "- people: visible person counts, roles, clothing, or descriptions; no names unless readable/visible\n"
-                            "- setting: short visible place/background description\n"
-                            "- visible_text: readable text/OCR in the image; [] if none\n"
-                            "- visual_keywords: 8-20 Korean search keywords and common synonyms for visible objects, actions, and setting\n\n"
-                            "Rules:\n"
-                            "- Do not describe sound, dialogue, prior plot, camera intent, or hidden emotions.\n"
-                            "- Use plain Korean words a user might search for.\n"
-                            "- Keep arrays deduplicated and remove vague words unless visually grounded.\n"
-                            "- Use [] or empty string when unknown.\n"
-                            "Return exactly one JSON object and no markdown. /no_think"
+                            "키프레임을 한국어 검색용으로 설명하세요.\n"
+                            "- 2-4개의 짧은 문장으로 작성하세요.\n"
+                            "- 보이는 인물, 복장, 자세, 행동, 물체, 배경, 읽을 수 있는 글자를 구체적으로 적으세요.\n"
+                            "- 소리, 대사, 이전 줄거리, 숨은 감정, 이름, 관계는 추측하지 마세요.\n"
+                            "- JSON이나 마크다운 없이 일반 텍스트만 반환하세요. /no_think"
                         ),
                     },
                 ],
             },
         ]
         try:
-            data = self.chat.chat_json(
+            description = self.chat.chat_text(
                 self.model,
                 messages,
-                max_tokens=900,
-                response_format={"type": "json_object"},
-                extra_body=NO_REASONING_EXTRA_BODY,
+                max_tokens=500,
+                temperature=0.0,
             )
         except RuntimeError as exc:
-            if "Model did not return valid JSON" not in str(exc):
-                raise
             reason = str(exc).splitlines()[0]
-            print(f"[warn] VLM keyframe JSON failed; using fallback description: {reason}")
+            print(f"[warn] VLM keyframe text failed; using fallback description: {reason}")
             return FrameDescription(
                 frame_description="키프레임 이미지 설명을 생성하지 못했습니다.",
                 visible_objects=[],
@@ -383,16 +370,18 @@ class VideoVLMClient:
                 visual_keywords=[],
             )
 
+        description = _clip_multiline_text(ensure_str(description), 1200)
+        if not description:
+            print("[warn] VLM keyframe text was empty; using fallback description.")
+            description = "키프레임 이미지 설명을 생성하지 못했습니다."
         return FrameDescription(
-            frame_description=ensure_str(
-                data.get("frame_description") or data.get("description")
-            ),
-            visible_objects=_unique_str_list(data.get("visible_objects"), limit=12),
-            visible_actions=_unique_str_list(data.get("visible_actions"), limit=12),
-            people=_unique_str_list(data.get("people"), limit=10),
-            setting=ensure_str(data.get("setting")),
-            visible_text=_unique_str_list(data.get("visible_text"), limit=12),
-            visual_keywords=_unique_str_list(data.get("visual_keywords"), limit=20),
+            frame_description=description,
+            visible_objects=[],
+            visible_actions=[],
+            people=[],
+            setting="",
+            visible_text=[],
+            visual_keywords=[],
         )
 
     @staticmethod
@@ -421,7 +410,7 @@ class SummaryLLMClient:
                 "role": "system",
                 "content": (
                     "You write retrieval-optimized Korean metadata for one video shot. "
-                    "Use only the provided keyframe visual metadata and overlapping subtitles. "
+                    "Use only the provided keyframe visual description and overlapping subtitles. "
                     "The output will be used for semantic vector search and keyword/BM25 search, "
                     "so preserve concrete nouns, actions, people, objects, places, and dialogue terms. "
                     "Do not invent facts, names, emotions, places, relationships, or story context "

@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from contextlib import contextmanager
 from datetime import datetime
@@ -248,6 +249,9 @@ def cmd_index(args: argparse.Namespace) -> None:
                 local_batch_size=local_embedding_batch_size,
                 local_max_length=local_embedding_max_length,
             )
+            embedding_vector_size = getattr(embedder, "vector_size", None)
+            if embedding_vector_size:
+                store.ensure_collection_compatible(args.collection, embedding_vector_size)
 
         records_path = run_dir / "indexed_scenes.json"
         api_results_path = run_dir / "api_results.jsonl"
@@ -862,7 +866,16 @@ def main() -> None:
         sys.stderr.reconfigure(line_buffering=True)
     parser = build_parser()
     args = parser.parse_args()
-    args.func(args)
+    try:
+        args.func(args)
+    except Exception as exc:
+        print(f"[error] {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        traceback.print_exception(exc, file=sys.stderr)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        if os.name == "nt" and args.func is cmd_index:
+            os._exit(1)
+        raise SystemExit(1) from None
     sys.stdout.flush()
     sys.stderr.flush()
     if os.name == "nt" and args.func is cmd_index:

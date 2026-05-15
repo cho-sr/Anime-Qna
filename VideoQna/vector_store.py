@@ -89,6 +89,7 @@ class QdrantSummaryStore:
             "collection": collection,
             "exists": True,
             "qdrant_path": str(self.qdrant_path),
+            "vector_size": self._collection_vector_size(collection),
             "points_count": count,
         }
 
@@ -99,6 +100,9 @@ class QdrantSummaryStore:
 
     def collection_exists(self, collection: str) -> bool:
         return self._collection_exists(collection)
+
+    def ensure_collection_compatible(self, collection: str, vector_size: int) -> None:
+        self._ensure_collection(collection, vector_size=vector_size)
 
     def dense_search(
         self,

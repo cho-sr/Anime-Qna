@@ -6,9 +6,9 @@ VideoQna indexes a local video into Qdrant using this flow:
 2. Create a low-resolution proxy video and split shots with TransNetV2.
 3. Select one representative keyframe per shot by choosing the frame nearest
    the shot's average visual feature centroid.
-4. Send only the keyframe image to a Hugging Face Router Qwen VLM API.
-5. Send the VLM frame description plus the full shot subtitles to a Qwen LLM API.
-6. Embed the LLM `search_text` retrieval document with a Hugging Face feature-extraction API.
+4. Send only the keyframe image to a Hugging Face Router Qwen VLM API for a plain-text visual description.
+5. Send the VLM text plus the full shot subtitles to a Qwen LLM API, which structures the scene JSON.
+6. Embed the LLM `search_text` retrieval document.
 7. Store the vector and JSON metadata in local persistent Qdrant.
 
 ## Setup

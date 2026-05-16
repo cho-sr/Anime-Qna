@@ -6,9 +6,9 @@ VideoQna indexes a local video into Qdrant using this flow:
 2. Create a low-resolution proxy video and split shots with TransNetV2.
 3. Select one representative keyframe per shot by choosing the frame nearest
    the shot's average visual feature centroid.
-4. Send only the keyframe image to a Hugging Face Router Qwen VLM API for a plain-text visual description.
-5. Send the VLM text plus the full shot subtitles to a Qwen LLM API, which structures the scene JSON.
-6. Embed the LLM `search_text` retrieval document.
+4. Send keyframe images plus overlapping subtitles to a Hugging Face Router Qwen multimodal API in small batches.
+5. Receive structured scene JSON with summaries, visual/dialogue keywords, and `search_text`.
+6. Embed the scene `search_text` retrieval document.
 7. Store the vector and JSON metadata in local persistent Qdrant.
 
 ## Setup
@@ -49,6 +49,16 @@ HF_VLM_MODEL=Qwen/Qwen3.5-9B
 HF_VLM_PROVIDER=together
 ```
 
+If Hugging Face Router is slow or busy, transient timeout retries can appear
+while indexing. They are safe if the run continues. To wait longer before a
+request is treated as timed out, set:
+
+```env
+HF_CHAT_TIMEOUT=180
+HF_CHAT_MAX_RETRIES=5
+HF_CHAT_RETRY_BASE_DELAY=1.0
+```
+
 By default, embeddings run locally with Qwen3-Embedding-0.6B. The first run
 downloads the model into the Hugging Face cache, then reuses it for indexing and
 RAG queries:
@@ -84,7 +94,7 @@ brew install ffmpeg
 ## Index
 
 ```bash
-python pipeline.py index --video ../ep_1.mp4 --collection video_qna --max-shots 3
+python pipeline.py index --video ../ep_1.mp4 --collection video_qna_qwen06b --max-shots 3
 ```
 
 Useful options:
@@ -92,7 +102,7 @@ Useful options:
 ```bash
 python pipeline.py index \
   --video /path/to/video.mp4 \
-  --collection video_qna \
+  --collection video_qna_qwen06b \
   --whisper-model base \
   --whisper-device cuda \
   --whisper-compute-type int8 \
@@ -103,7 +113,8 @@ python pipeline.py index \
   --proxy-width 320 \
   --keyframe-workers 1 \
   --api-workers 3 \
-  --api-mode stage \
+  --api-mode unified \
+  --scene-batch-size 8 \
   --embedding-backend local \
   --local-embedding-model Qwen/Qwen3-Embedding-0.6B \
   --qdrant-batch-size 16 \
@@ -115,21 +126,36 @@ By default, Whisper runs on CUDA with `int8` compute type. TransNetV2 keeps the
 Add `--whisper-vad` if you want faster-whisper's optional silence filtering and
 your ONNX Runtime install is stable.
 
+For Japanese videos, pass `--language ja` and consider `--whisper-model small`
+or `medium` if the default `base` subtitles look garbled. You can also raise
+`--whisper-beam-size` and set `WHISPER_INITIAL_PROMPT` with common names or terms
+to bias transcription toward the right spellings.
+
+Character names usually need either clear subtitle mentions or an optional
+sidecar glossary. This is not required for every video; it is a per-video hint
+when you know the cast or aliases. For a video `video/ep_1.mp4`, VideoQna
+automatically uses the first matching UTF-8 file:
+`video/ep_1.characters.txt`, `video/ep_1.cast.txt`, or
+`video/ep_1.glossary.txt`. Each line can contain a name plus visual clues, for
+example `탄지로 / Tanjiro / 炭治郎: 이마 흉터, 체크무늬 겉옷, 검붉은 머리`.
+
 With `--keyframe-workers 1`, keyframes are extracted with a single-pass sampler:
 the video is scanned in timestamp order to avoid repeated random seeks. Values
 above `1` use parallel per-shot seeking, which can be faster on some SSDs but
 may be slower for long compressed videos.
 
-The default `--api-mode stage` overlaps separate VLM, LLM, and embedding pools:
-VLM descriptions are submitted first, LLM summaries start as soon as each VLM
-result is ready, and embeddings/Qdrant writes follow completed summaries.
-`--api-workers` sets the default pool size for remote stages; use `--vlm-workers`
-or `--llm-workers` to tune them separately. Local embeddings are shared across
-workers so the model is loaded once, and the embedding stage is forced to one
-worker to avoid loading duplicate CUDA models. Completed summaries are
-accumulated up to `LOCAL_EMBEDDING_BATCH_SIZE` before local embedding inference,
-so logs should show `batch=8` when enough summaries are ready. `--api-mode shot`
-keeps the old per-shot `VLM -> LLM -> embedding` worker behavior.
+The default `--api-mode unified` sends `--scene-batch-size 8` keyframe images
+plus their subtitles to one multimodal Qwen call, then embeds completed scene
+`search_text` locally. Inside that single Qwen call, the prompt asks the model
+to process each shot in two internal passes: first inspect the keyframe image
+only, then combine that visual evidence with subtitles for the final JSON. This
+avoids the older two-call `VLM -> LLM` path for each shot. `--api-workers`
+controls how many unified scene batches can be in flight.
+Local embeddings are shared across workers so the model is loaded once, and the
+embedding stage is forced to one worker to avoid loading duplicate CUDA models.
+Completed summaries are accumulated up to `LOCAL_EMBEDDING_BATCH_SIZE` before
+local embedding inference. Use `--api-mode stage` or `--api-mode shot` only if
+you want the older split `VLM -> LLM -> embedding` behavior.
 
 `--qdrant-batch-size` controls how many completed shots are written per Qdrant
 upsert batch. Parallel API calls reduce wall-clock waiting time but do not
@@ -137,6 +163,28 @@ reduce the number of remote VLM/LLM requests.
 Completed per-shot API results are also checkpointed to `api_results.jsonl`
 before Qdrant writes, so `--resume-run` can avoid repeating successful remote
 calls after an interruption.
+
+After indexing, you can run a video-level entity sweep to infer recurring
+character/person candidates from all stored scene summaries and subtitles, then
+attach supported names back to matching shots and re-embed only those updated
+shots:
+
+```bash
+python pipeline.py entities \
+  --run-dir data/runs/<run_id> \
+  --collection video_qna_qwen06b
+```
+
+This is an indexing-time/post-processing step, not a query-time step. It adds
+time once after indexing, but normal `/ask` retrieval stays fast. If the API
+server is running against local Qdrant, stop it before this command because
+local Qdrant storage cannot be opened by two Python processes at once.
+
+The `shot_api` timing includes remote multimodal scene calls, local embedding,
+and Qdrant writes. In the older `stage`/`shot` modes it also includes separate
+VLM and LLM calls. Local embedding batch duration is logged separately as
+`[embedding] local batch_done=... elapsed=...s`; if total `shot_api` is long but
+embedding batch logs are short, the remote model calls are the bottleneck.
 
 Indexing writes a timing report to each run directory:
 
@@ -151,7 +199,7 @@ default weights loaded by the installed `transnetv2_pytorch` package.
 ## Stats
 
 ```bash
-python pipeline.py stats --collection video_qna
+python pipeline.py stats --collection video_qna_qwen06b
 ```
 
 ## RAG API
@@ -175,7 +223,7 @@ curl -X POST http://localhost:8000/ask \
   -H "Content-Type: application/json" \
   -d '{
     "question": "주인공이 놀라거나 당황하는 장면은?",
-    "collection": "video_qna",
+    "collection": "video_qna_qwen06b",
     "top_k": 5,
     "dense_top_k": 20,
     "bm25_top_k": 20,

@@ -253,6 +253,7 @@ class LocalQwenSummaryEmbedder:
         with self._lock:
             for start in range(0, len(cleaned), self.batch_size):
                 batch_texts = cleaned[start : start + self.batch_size]
+                batch_start = time.perf_counter()
                 encoded = self.tokenizer(
                     batch_texts,
                     padding=True,
@@ -273,6 +274,11 @@ class LocalQwenSummaryEmbedder:
                     if self.normalize:
                         pooled = self.torch.nn.functional.normalize(pooled, p=2, dim=1)
                 vectors.extend(pooled.detach().cpu().float().numpy().tolist())
+                elapsed = time.perf_counter() - batch_start
+                print(
+                    f"[embedding] local batch_done={len(batch_texts)} "
+                    f"elapsed={elapsed:.2f}s"
+                )
         return vectors
 
     def format_query(self, query: str) -> str:

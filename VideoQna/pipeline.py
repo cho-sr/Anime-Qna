@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from threading import local
 
-from utils import safe_stem, write_json
+from utils import ensure_str, ensure_str_list, safe_stem, seconds_to_timestamp, write_json
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -98,6 +98,29 @@ def read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
+def read_optional_text(path_value: str | None) -> str:
+    if not path_value:
+        return ""
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        path = (BASE_DIR / path).resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"character glossary file not found: {path}")
+    return path.read_text(encoding="utf-8").strip()
+
+
+def character_glossary_sidecar(video_path: Path) -> Path | None:
+    candidates = [
+        video_path.with_suffix(".characters.txt"),
+        video_path.with_suffix(".cast.txt"),
+        video_path.with_suffix(".glossary.txt"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
 def append_jsonl(path: Path, item: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as file:
@@ -108,6 +131,12 @@ def worker_count(value: int | None) -> int:
     return max(1, int(value or 1))
 
 
+def chunked(items: list, size: int):
+    size = max(1, int(size or 1))
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
 def record_sort_key(record: dict) -> tuple[int, int]:
     shot = record.get("shot") if isinstance(record, dict) else None
     if isinstance(shot, dict) and shot.get("shot_id") is not None:
@@ -115,11 +144,214 @@ def record_sort_key(record: dict) -> tuple[int, int]:
     return (1, 0)
 
 
+def compact_scene_for_entities(record: dict) -> dict:
+    shot = record.get("shot") if isinstance(record, dict) else {}
+    summary = record.get("summary") if isinstance(record, dict) else {}
+    frame_description = record.get("frame_description") if isinstance(record, dict) else {}
+    subtitles = record.get("shot_subtitles") if isinstance(record, dict) else []
+    shot_start = float(shot.get("start_time") or 0.0)
+    shot_end = float(shot.get("end_time") or 0.0)
+    subtitle_text = " ".join(
+        ensure_str(item.get("text"))
+        for item in subtitles
+        if isinstance(item, dict) and ensure_str(item.get("text"))
+    )
+    return {
+        "shot_id": shot.get("shot_id"),
+        "timestamp": f"{seconds_to_timestamp(shot_start)} ~ {seconds_to_timestamp(shot_end)}",
+        "summary": ensure_str(summary.get("summary"))[:700],
+        "people": ensure_str_list(summary.get("people"))[:12],
+        "visual_keywords": ensure_str_list(summary.get("visual_keywords"))[:18],
+        "dialogue_keywords": ensure_str_list(summary.get("dialogue_keywords"))[:18],
+        "frame_description": ensure_str(frame_description.get("frame_description"))[:700],
+        "subtitles": subtitle_text[:700],
+    }
+
+
+def normalize_entity_candidates(entity_data: dict) -> list[dict]:
+    characters = entity_data.get("characters") if isinstance(entity_data, dict) else []
+    if not isinstance(characters, list):
+        return []
+    normalized = []
+    seen = set()
+    for item in characters:
+        if not isinstance(item, dict):
+            continue
+        name = ensure_str(item.get("canonical_name") or item.get("name"))
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        shot_ids = []
+        for shot_id in item.get("evidence_shot_ids") or []:
+            try:
+                shot_ids.append(int(shot_id))
+            except (TypeError, ValueError):
+                continue
+        normalized.append(
+            {
+                "canonical_name": name,
+                "aliases": ensure_str_list(item.get("aliases"))[:12],
+                "visual_clues": ensure_str_list(item.get("visual_clues"))[:16],
+                "evidence_shot_ids": sorted(set(shot_ids))[:80],
+                "confidence": ensure_str(item.get("confidence")) or "medium",
+            }
+        )
+    return normalized
+
+
+def normalize_entity_assignments(assignment_data: dict) -> dict[int, list[dict]]:
+    assignments = assignment_data.get("assignments") if isinstance(assignment_data, dict) else []
+    if not isinstance(assignments, list):
+        return {}
+    by_shot: dict[int, list[dict]] = {}
+    for item in assignments:
+        if not isinstance(item, dict):
+            continue
+        try:
+            shot_id = int(item.get("shot_id"))
+        except (TypeError, ValueError):
+            continue
+        names = ensure_str_list(item.get("names"))[:6]
+        if not names:
+            continue
+        by_shot.setdefault(shot_id, []).append(
+            {
+                "names": names,
+                "evidence": ensure_str(item.get("evidence"))[:500],
+                "confidence": ensure_str(item.get("confidence")) or "medium",
+            }
+        )
+    return by_shot
+
+
+def merge_assignment_maps(items: list[dict[int, list[dict]]]) -> dict[int, list[dict]]:
+    merged: dict[int, list[dict]] = {}
+    for item in items:
+        for shot_id, assignments in item.items():
+            existing_names = {
+                name.casefold()
+                for assignment in merged.setdefault(shot_id, [])
+                for name in assignment.get("names", [])
+            }
+            for assignment in assignments:
+                names = [
+                    name
+                    for name in assignment.get("names", [])
+                    if name.casefold() not in existing_names
+                ]
+                if not names:
+                    continue
+                existing_names.update(name.casefold() for name in names)
+                merged[shot_id].append({**assignment, "names": names})
+    return merged
+
+
+def enrich_records_with_entities(records: list[dict], assignments_by_shot: dict[int, list[dict]]) -> list[dict]:
+    changed = []
+    for record in records:
+        shot = record.get("shot") if isinstance(record, dict) else {}
+        try:
+            shot_id = int(shot.get("shot_id"))
+        except (TypeError, ValueError):
+            continue
+        assignments = assignments_by_shot.get(shot_id)
+        if not assignments:
+            continue
+
+        summary = record.setdefault("summary", {})
+        names = []
+        evidence_parts = []
+        for assignment in assignments:
+            for name in assignment.get("names", []):
+                if name and name not in names:
+                    names.append(name)
+            evidence = ensure_str(assignment.get("evidence"))
+            if evidence:
+                evidence_parts.append(evidence)
+
+        if not names:
+            continue
+
+        people = ensure_str_list(summary.get("people"))
+        for name in names:
+            if name not in people:
+                people.append(name)
+        summary["people"] = people
+
+        dialogue_keywords = ensure_str_list(summary.get("dialogue_keywords"))
+        for name in names:
+            if name not in dialogue_keywords:
+                dialogue_keywords.append(name)
+        summary["dialogue_keywords"] = dialogue_keywords
+
+        character_candidates = summary.get("character_candidates")
+        if not isinstance(character_candidates, list):
+            character_candidates = []
+        character_candidates.extend(assignments)
+        summary["character_candidates"] = character_candidates
+
+        search_text = ensure_str(summary.get("search_text") or summary.get("summary"))
+        entity_line = f"등장인물 후보: {', '.join(names)}"
+        evidence_line = ""
+        if evidence_parts:
+            evidence_line = f"등장인물 근거: {' / '.join(evidence_parts[:2])}"
+        additions = "\n".join(part for part in [entity_line, evidence_line] if part)
+        if additions and additions not in search_text:
+            summary["search_text"] = "\n".join(part for part in [search_text, additions] if part)
+        changed.append(record)
+    return changed
+
+
+def payload_from_enriched_record(
+    record: dict,
+    *,
+    existing_payload: dict | None = None,
+    embedding_model: str,
+    embedding_backend: str,
+) -> dict:
+    shot = record["shot"]
+    keyframe = record["keyframe"]
+    frame_description = record.get("frame_description", {})
+    summary = record.get("summary", {})
+    payload = dict(existing_payload or {})
+    payload.update(
+        {
+        "video_path": str(payload.get("video_path") or record.get("video_path") or ""),
+        "shot_id": shot.get("shot_id"),
+        "shot_start_sec": shot.get("start_time"),
+        "shot_end_sec": shot.get("end_time"),
+        "keyframe_timestamp_sec": keyframe.get("timestamp_sec"),
+        "image_path": keyframe.get("image_path"),
+        "frame_description": ensure_str(frame_description.get("frame_description")),
+        "shot_subtitles": record.get("shot_subtitles") or [],
+        "summary": ensure_str(summary.get("summary")),
+        "action": ensure_str_list(summary.get("action")),
+        "context": ensure_str(summary.get("context")),
+        "emotion": ensure_str_list(summary.get("emotion")),
+        "people": ensure_str_list(summary.get("people")),
+        "objects": ensure_str_list(summary.get("objects")),
+        "places": ensure_str_list(summary.get("places")),
+        "visual_keywords": ensure_str_list(summary.get("visual_keywords")),
+        "dialogue_keywords": ensure_str_list(summary.get("dialogue_keywords")),
+        "character_candidates": summary.get("character_candidates") or [],
+        "search_text": ensure_str(summary.get("search_text") or summary.get("summary")),
+        "vlm_model": payload.get("vlm_model") or record.get("vlm_model"),
+        "llm_model": payload.get("llm_model") or record.get("llm_model"),
+        "embedding_model": embedding_model,
+        "embedding_backend": embedding_backend,
+        }
+    )
+    return payload
+
+
 def cmd_index(args: argparse.Namespace) -> None:
     from tqdm import tqdm
 
     from embedding import DEFAULT_LOCAL_EMBEDDING_MODEL, create_summary_embedder
-    from hf_clients import SummaryLLMClient, VideoVLMClient
+    from hf_clients import SummaryLLMClient, UnifiedSceneClient, VideoVLMClient
     from keyframe_selector import (
         select_keyframe_for_shot,
         select_keyframes_single_pass,
@@ -159,15 +391,25 @@ def cmd_index(args: argparse.Namespace) -> None:
     timer = IndexTimer()
     print(f"[index] video={video_path}")
     print(f"[index] run_dir={run_dir}")
+    if args.api_mode == "unified" and args.skip_llm_summary:
+        print(
+            "[warn] --skip-llm-summary is ignored with --api-mode unified; "
+            "unified mode uses one multimodal scene-summary call.",
+            flush=True,
+        )
 
     store = None
     whisper_extractor = None
+    completed_ok = False
     try:
         with timer.step("qdrant_setup", qdrant_path=str(qdrant_path)):
             store = QdrantSummaryStore(qdrant_path=qdrant_path)
 
         subtitles_path = run_dir / "subtitles.json"
         shots_path = run_dir / "shots.json"
+        whisper_initial_prompt = (
+            os.getenv("WHISPER_INITIAL_PROMPT") or args.whisper_initial_prompt or ""
+        )
 
         if args.resume_run and subtitles_path.exists():
             with timer.step("load_subtitles", source=str(subtitles_path)):
@@ -180,6 +422,8 @@ def cmd_index(args: argparse.Namespace) -> None:
                     device=args.whisper_device,
                     compute_type=args.whisper_compute_type,
                     vad_filter=args.whisper_vad,
+                    beam_size=args.whisper_beam_size,
+                    initial_prompt=whisper_initial_prompt,
                 )
                 subtitles = whisper_extractor.transcribe(video_path)
                 print(f"[index] saving subtitles={subtitles_path}", flush=True)
@@ -227,6 +471,14 @@ def cmd_index(args: argparse.Namespace) -> None:
         local_embedding_max_length = int(
             os.getenv("LOCAL_EMBEDDING_MAX_LENGTH", args.local_embedding_max_length)
         )
+        character_glossary = os.getenv("CHARACTER_GLOSSARY", "").strip()
+        character_glossary_path = os.getenv("CHARACTER_GLOSSARY_PATH") or args.character_glossary
+        if not character_glossary and not character_glossary_path:
+            sidecar_path = character_glossary_sidecar(video_path)
+            if sidecar_path is not None:
+                character_glossary_path = str(sidecar_path)
+        if character_glossary_path:
+            character_glossary = read_optional_text(character_glossary_path)
 
         effective_llm_model = "skipped" if args.skip_llm_summary else llm_model
         with timer.step(
@@ -235,11 +487,23 @@ def cmd_index(args: argparse.Namespace) -> None:
             llm_model=effective_llm_model,
             embedding_model=embedding_model,
             embedding_backend=embedding_backend,
+            character_glossary=bool(character_glossary),
         ):
             vlm = VideoVLMClient(token=hf_token, model=vlm_model, provider=vlm_provider)
+            unified = UnifiedSceneClient(
+                token=hf_token,
+                model=vlm_model,
+                provider=vlm_provider,
+                character_glossary=character_glossary,
+            )
             llm = None
             if not args.skip_llm_summary:
-                llm = SummaryLLMClient(token=hf_token, model=llm_model, provider=llm_provider)
+                llm = SummaryLLMClient(
+                    token=hf_token,
+                    model=llm_model,
+                    provider=llm_provider,
+                    character_glossary=character_glossary,
+                )
             embedder = create_summary_embedder(
                 backend=embedding_backend,
                 model_name=embedding_model,
@@ -318,6 +582,7 @@ def cmd_index(args: argparse.Namespace) -> None:
         if getattr(embedder, "is_local", False):
             embedding_workers = 1
         qdrant_batch_size = worker_count(args.qdrant_batch_size)
+        scene_batch_size = worker_count(args.scene_batch_size)
         pending_shots = []
         for shot in shots:
             shot_label = f"shot_{shot.shot_id:04d}"
@@ -394,6 +659,7 @@ def cmd_index(args: argparse.Namespace) -> None:
                         token=hf_token,
                         model=llm_model,
                         provider=llm_provider,
+                        character_glossary=character_glossary,
                     )
                 if getattr(embedder, "is_local", False):
                     worker_embedder = embedder
@@ -412,6 +678,7 @@ def cmd_index(args: argparse.Namespace) -> None:
             return clients
 
         vlm_worker_state = local()
+        unified_worker_state = local()
         llm_worker_state = local()
         embedding_worker_state = local()
 
@@ -429,6 +696,21 @@ def cmd_index(args: argparse.Namespace) -> None:
                 vlm_worker_state.client = client
             return client
 
+        def get_unified_client():
+            if api_workers == 1:
+                return unified
+
+            client = getattr(unified_worker_state, "client", None)
+            if client is None:
+                client = UnifiedSceneClient(
+                    token=hf_token,
+                    model=vlm_model,
+                    provider=vlm_provider,
+                    character_glossary=character_glossary,
+                )
+                unified_worker_state.client = client
+            return client
+
         def get_llm_client():
             if args.skip_llm_summary:
                 return None
@@ -441,6 +723,7 @@ def cmd_index(args: argparse.Namespace) -> None:
                     token=hf_token,
                     model=llm_model,
                     provider=llm_provider,
+                    character_glossary=character_glossary,
                 )
                 llm_worker_state.client = client
             return client
@@ -549,6 +832,72 @@ def cmd_index(args: argparse.Namespace) -> None:
                 }
                 for result, vector in zip(summary_results, vectors)
             ]
+
+        def process_unified_stage(scene_batch):
+            return get_unified_client().summarize_scenes(scene_batch)
+
+        def process_unified_pipeline(scenes, progress) -> None:
+            embedding_batch_size = (
+                local_embedding_batch_size
+                if getattr(embedder, "is_local", False)
+                else 1
+            )
+            scene_batches = list(chunked(scenes, scene_batch_size))
+            print(
+                "[api] unified pipeline "
+                f"api_workers={api_workers} scene_batch_size={scene_batch_size} "
+                f"embedding_workers={embedding_workers} "
+                f"embedding_batch_size={embedding_batch_size}",
+                flush=True,
+            )
+            with (
+                ThreadPoolExecutor(max_workers=api_workers) as unified_executor,
+                ThreadPoolExecutor(max_workers=embedding_workers) as embedding_executor,
+            ):
+                active = {}
+                pending_embedding = []
+
+                def submit_embedding_batch(*, force: bool = False) -> None:
+                    nonlocal pending_embedding
+                    while pending_embedding and (
+                        force or len(pending_embedding) >= embedding_batch_size
+                    ):
+                        if force:
+                            batch = list(pending_embedding)
+                            pending_embedding.clear()
+                        else:
+                            batch = pending_embedding[:embedding_batch_size]
+                            del pending_embedding[:embedding_batch_size]
+                        active[
+                            embedding_executor.submit(
+                                process_embedding_batch_stage,
+                                batch,
+                            )
+                        ] = "embedding_batch"
+
+                for scene_batch in scene_batches:
+                    active[unified_executor.submit(process_unified_stage, scene_batch)] = "unified"
+
+                while active or pending_embedding:
+                    if pending_embedding and not any(
+                        stage == "unified" for stage in active.values()
+                    ):
+                        submit_embedding_batch(force=True)
+
+                    if not active:
+                        continue
+
+                    done, _pending = wait(active, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        stage = active.pop(future)
+                        result = future.result()
+                        if stage == "unified":
+                            pending_embedding.extend(result)
+                            submit_embedding_batch()
+                        else:
+                            for item in result:
+                                queue_scene_result(item)
+                            progress.update(len(result))
 
         def process_stage_pipeline(scenes, progress) -> None:
             embedding_batch_size = (
@@ -705,6 +1054,7 @@ def cmd_index(args: argparse.Namespace) -> None:
                 shots=len(prepared_scenes),
                 workers=api_workers,
                 api_mode=args.api_mode,
+                scene_batch_size=scene_batch_size,
                 vlm_workers=vlm_workers,
                 llm_workers=llm_workers,
                 embedding_workers=embedding_workers,
@@ -715,7 +1065,14 @@ def cmd_index(args: argparse.Namespace) -> None:
                 qdrant_batch_size=qdrant_batch_size,
             ):
                 try:
-                    if args.api_mode == "stage":
+                    if args.api_mode == "unified":
+                        with tqdm(
+                            total=len(prepared_scenes),
+                            desc="api",
+                            unit="shot",
+                        ) as progress:
+                            process_unified_pipeline(prepared_scenes, progress)
+                    elif args.api_mode == "stage":
                         with tqdm(
                             total=len(prepared_scenes),
                             desc="api",
@@ -745,6 +1102,7 @@ def cmd_index(args: argparse.Namespace) -> None:
 
         print(f"[index] done: {len(records)} shots indexed into collection={args.collection}")
         print(f"[index] artifacts={run_dir}")
+        completed_ok = True
     finally:
         timing_data = timer.to_dict()
         write_json(run_dir / "timings.json", timing_data)
@@ -756,6 +1114,10 @@ def cmd_index(args: argparse.Namespace) -> None:
             flush=True,
         )
         print(f"[time] timings={run_dir / 'timings.json'}", flush=True)
+        if completed_ok and getattr(args, "_exit_after_success", False):
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
 
 
 def cmd_stats(args: argparse.Namespace) -> None:
@@ -768,6 +1130,195 @@ def cmd_stats(args: argparse.Namespace) -> None:
         store.close()
 
 
+def cmd_entities(args: argparse.Namespace) -> None:
+    from tqdm import tqdm
+
+    from embedding import DEFAULT_LOCAL_EMBEDDING_MODEL, create_summary_embedder
+    from hf_clients import VideoEntitySweepClient
+    from vector_store import QdrantSummaryStore
+
+    load_env()
+
+    run_dir = Path(args.run_dir).expanduser()
+    if not run_dir.is_absolute():
+        run_dir = (BASE_DIR / run_dir).resolve()
+    records_path = run_dir / "indexed_scenes.json"
+    if not records_path.exists():
+        raise FileNotFoundError(f"indexed scenes file not found: {records_path}")
+
+    records = read_json(records_path)
+    if not isinstance(records, list) or not records:
+        raise RuntimeError(f"No indexed scene records found in {records_path}")
+
+    hf_token = os.getenv("HF_TOKEN", "")
+    hf_provider = os.getenv("HF_PROVIDER") or None
+    llm_provider = os.getenv("HF_LLM_PROVIDER") or hf_provider
+    llm_model = os.getenv("HF_LLM_MODEL", args.llm_model)
+    embedding_backend = (os.getenv("EMBEDDING_BACKEND") or args.embedding_backend).strip().lower()
+    embedding_provider = os.getenv("HF_EMBEDDING_PROVIDER") or hf_provider
+    if embedding_backend == "local":
+        embedding_model = os.getenv(
+            "LOCAL_EMBEDDING_MODEL",
+            args.local_embedding_model or DEFAULT_LOCAL_EMBEDDING_MODEL,
+        )
+        embedding_provider = "local"
+    else:
+        embedding_model = os.getenv("HF_EMBEDDING_MODEL", args.embedding_model)
+    local_embedding_device = os.getenv("LOCAL_EMBEDDING_DEVICE", args.local_embedding_device)
+    local_embedding_batch_size = max(
+        1,
+        int(os.getenv("LOCAL_EMBEDDING_BATCH_SIZE", args.local_embedding_batch_size)),
+    )
+    local_embedding_max_length = int(
+        os.getenv("LOCAL_EMBEDDING_MAX_LENGTH", args.local_embedding_max_length)
+    )
+
+    timer = IndexTimer()
+    print(f"[entities] run_dir={run_dir}")
+    print(f"[entities] records={len(records)} collection={args.collection}")
+
+    store = None
+    existing_payload_by_id = {}
+    try:
+        with timer.step("entity_client_setup", llm_model=llm_model):
+            entity_client = VideoEntitySweepClient(
+                token=hf_token,
+                model=llm_model,
+                provider=llm_provider,
+            )
+            embedder = create_summary_embedder(
+                backend=embedding_backend,
+                model_name=embedding_model,
+                token=hf_token,
+                provider=embedding_provider,
+                local_device=local_embedding_device,
+                local_batch_size=local_embedding_batch_size,
+                local_max_length=local_embedding_max_length,
+            )
+
+        if not args.dry_run:
+            qdrant_path_value = (
+                os.getenv("QDRANT_PATH")
+                if args.qdrant_path == str(DEFAULT_DATA_DIR / "qdrant")
+                else args.qdrant_path
+            )
+            qdrant_path = Path(qdrant_path_value or args.qdrant_path).expanduser().resolve()
+            with timer.step("entity_qdrant_setup", qdrant_path=str(qdrant_path)):
+                store = QdrantSummaryStore(qdrant_path=qdrant_path)
+                existing_payload_by_id = {
+                    item["id"]: item["payload"]
+                    for item in store.scroll_payloads(args.collection)
+                }
+
+        compact_scenes = [compact_scene_for_entities(record) for record in records]
+        compact_scenes = [scene for scene in compact_scenes if scene.get("shot_id") is not None]
+
+        candidate_batches = []
+        with timer.step("entity_candidate_sweep", scenes=len(compact_scenes), chunk_size=args.entity_chunk_size):
+            for batch in tqdm(
+                list(chunked(compact_scenes, args.entity_chunk_size)),
+                desc="entity-candidates",
+                unit="chunk",
+            ):
+                data = entity_client.infer_candidates(batch)
+                candidate_batches.append({"characters": normalize_entity_candidates(data)})
+
+        all_candidates = [
+            character
+            for batch in candidate_batches
+            for character in batch.get("characters", [])
+        ]
+        with timer.step("entity_candidate_merge", candidates=len(all_candidates)):
+            if not all_candidates:
+                entities = {"characters": []}
+            elif len(candidate_batches) == 1:
+                entities = {"characters": all_candidates}
+            else:
+                entities = {
+                    "characters": normalize_entity_candidates(
+                        entity_client.merge_candidates(all_candidates)
+                    )
+                }
+            write_json(run_dir / "video_entities.json", entities)
+            print(f"[entities] candidates={len(entities['characters'])}")
+
+        assignment_maps = []
+        with timer.step("entity_scene_assignment", scenes=len(compact_scenes), chunk_size=args.entity_chunk_size):
+            if entities["characters"]:
+                for batch in tqdm(
+                    list(chunked(compact_scenes, args.entity_chunk_size)),
+                    desc="entity-assign",
+                    unit="chunk",
+                ):
+                    data = entity_client.assign_entities(entities, batch)
+                    assignment_maps.append(normalize_entity_assignments(data))
+            assignments_by_shot = merge_assignment_maps(assignment_maps)
+            assignment_rows = [
+                {"shot_id": shot_id, "assignments": assignments}
+                for shot_id, assignments in sorted(assignments_by_shot.items())
+            ]
+            write_json(run_dir / "entity_assignments.json", assignment_rows)
+            print(f"[entities] assigned_shots={len(assignments_by_shot)}")
+
+        changed_records = enrich_records_with_entities(records, assignments_by_shot)
+        print(f"[entities] changed_records={len(changed_records)}")
+        if args.dry_run or not changed_records:
+            return
+
+        backup_path = run_dir / "indexed_scenes.pre_entities.json"
+        if not backup_path.exists():
+            write_json(backup_path, read_json(records_path))
+        write_json(records_path, records)
+
+        embed_texts = getattr(embedder, "embed_texts", None)
+        with timer.step(
+            "entity_reembed_upsert",
+            records=len(changed_records),
+            qdrant_batch_size=args.qdrant_batch_size,
+            embedding_model=embedding_model,
+            embedding_backend=embedding_backend,
+        ):
+            for batch in tqdm(
+                list(chunked(changed_records, args.qdrant_batch_size)),
+                desc="entity-upsert",
+                unit="batch",
+            ):
+                texts = [
+                    ensure_str(record.get("summary", {}).get("search_text"))
+                    or ensure_str(record.get("summary", {}).get("summary"))
+                    for record in batch
+                ]
+                vectors = embed_texts(texts) if callable(embed_texts) else [
+                    embedder.embed_document(text) for text in texts
+                ]
+                points = []
+                for record, vector in zip(batch, vectors):
+                    point_id = ensure_str(record.get("point_id"))
+                    if not point_id:
+                        raise RuntimeError("Cannot update entity-enriched record without point_id.")
+                    payload = payload_from_enriched_record(
+                        record,
+                        existing_payload=existing_payload_by_id.get(point_id),
+                        embedding_model=embedding_model,
+                        embedding_backend=embedding_backend,
+                    )
+                    points.append((point_id, vector, payload))
+                store.upsert_points(args.collection, points)
+
+        print(f"[entities] done: updated {len(changed_records)} records in collection={args.collection}")
+    finally:
+        timing_data = timer.to_dict()
+        write_json(run_dir / "entity_timings.json", timing_data)
+        if store is not None:
+            store.close()
+        print(
+            "[time] ENTITIES elapsed="
+            f"{timing_data['total_elapsed_hms']} ({timing_data['total_elapsed_sec']:.2f}s)",
+            flush=True,
+        )
+        print(f"[time] entity timings={run_dir / 'entity_timings.json'}", flush=True)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="VideoQna ingestion pipeline")
     default_qdrant_path = str(DEFAULT_DATA_DIR / "qdrant")
@@ -776,7 +1327,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_index = subparsers.add_parser("index", help="Index a local video")
     p_index.add_argument("--video", required=True, help="Local video path")
-    p_index.add_argument("--collection", default="video_qna", help="Qdrant collection")
+    p_index.add_argument("--collection", default="video_qna_qwen06b", help="Qdrant collection")
     p_index.add_argument("--data-dir", default=str(DEFAULT_DATA_DIR), help="Artifacts directory")
     p_index.add_argument("--qdrant-path", default=default_qdrant_path, help="Local Qdrant path")
     p_index.add_argument("--max-shots", type=int, default=None, help="Process only first N shots")
@@ -794,9 +1345,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_index.add_argument(
         "--api-mode",
-        default="stage",
-        choices=["stage", "shot"],
-        help="shot runs VLM->LLM->embedding per worker; stage overlaps VLM, LLM, and embedding pools",
+        default="unified",
+        choices=["unified", "stage", "shot"],
+        help="unified sends image+subtitles to one multimodal model call; stage/shot keep the older VLM->LLM flow",
+    )
+    p_index.add_argument(
+        "--scene-batch-size",
+        type=int,
+        default=8,
+        help="Number of scenes per unified multimodal API request",
     )
     p_index.add_argument("--vlm-workers", type=int, default=None, help="VLM stage workers; defaults to --api-workers")
     p_index.add_argument("--llm-workers", type=int, default=None, help="LLM stage workers; defaults to --api-workers")
@@ -827,6 +1384,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Enable faster-whisper's optional VAD filter. Disabled by default because it imports ONNX Runtime.",
     )
+    p_index.add_argument(
+        "--whisper-beam-size",
+        type=int,
+        default=5,
+        help="Whisper beam size. Higher values can improve ASR quality but are slower.",
+    )
+    p_index.add_argument(
+        "--whisper-initial-prompt",
+        default="",
+        help="Optional Whisper prompt with language/style/name hints, e.g. Japanese character names.",
+    )
 
     p_index.add_argument("--transnet-threshold", type=float, default=0.5)
     p_index.add_argument("--transnet-device", default="auto", help="TransNetV2 device: auto/cuda/cpu")
@@ -834,6 +1402,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--proxy-width", type=int, default=320)
     p_index.add_argument("--candidate-stride", type=float, default=0.5)
     p_index.add_argument("--subtitle-padding", type=float, default=0.5)
+    p_index.add_argument(
+        "--character-glossary",
+        default=None,
+        help="Optional UTF-8 text file with character names, aliases, and visual clues for scene summaries",
+    )
     p_index.add_argument(
         "--skip-llm-summary",
         action="store_true",
@@ -851,9 +1424,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.set_defaults(func=cmd_index)
 
     p_stats = subparsers.add_parser("stats", help="Show Qdrant collection stats")
-    p_stats.add_argument("--collection", default="video_qna", help="Qdrant collection")
+    p_stats.add_argument("--collection", default="video_qna_qwen06b", help="Qdrant collection")
     p_stats.add_argument("--qdrant-path", default=default_qdrant_path, help="Local Qdrant path")
     p_stats.set_defaults(func=cmd_stats)
+
+    p_entities = subparsers.add_parser(
+        "entities",
+        help="Infer video-level character candidates and enrich indexed scenes",
+    )
+    p_entities.add_argument("--run-dir", required=True, help="Run directory containing indexed_scenes.json")
+    p_entities.add_argument("--collection", default="video_qna_qwen06b", help="Qdrant collection to update")
+    p_entities.add_argument("--qdrant-path", default=default_qdrant_path, help="Local Qdrant path")
+    p_entities.add_argument("--llm-model", default="Qwen/Qwen3.5-9B:together")
+    p_entities.add_argument("--entity-chunk-size", type=int, default=50)
+    p_entities.add_argument("--qdrant-batch-size", type=int, default=32)
+    p_entities.add_argument("--dry-run", action="store_true", help="Write entity JSON files but do not update records or Qdrant")
+    p_entities.add_argument("--embedding-model", default="ibm-granite/granite-embedding-97m-multilingual-r2")
+    p_entities.add_argument("--embedding-backend", default="local", choices=["local", "api"])
+    p_entities.add_argument("--local-embedding-model", default="Qwen/Qwen3-Embedding-0.6B")
+    p_entities.add_argument("--local-embedding-device", default="auto", help="Local embedding device: auto/cuda/cpu")
+    p_entities.add_argument("--local-embedding-batch-size", type=int, default=8)
+    p_entities.add_argument("--local-embedding-max-length", type=int, default=2048)
+    p_entities.set_defaults(func=cmd_entities)
 
     return parser
 
@@ -866,6 +1458,8 @@ def main() -> None:
         sys.stderr.reconfigure(line_buffering=True)
     parser = build_parser()
     args = parser.parse_args()
+    if os.name == "nt" and args.func is cmd_index:
+        setattr(args, "_exit_after_success", True)
     try:
         args.func(args)
     except Exception as exc:

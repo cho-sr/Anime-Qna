@@ -67,6 +67,37 @@ class QdrantSummaryStore:
         )
         return point_ids
 
+    def upsert_points(
+        self,
+        collection: str,
+        points_data: list[tuple[str, list[float], dict[str, Any]]],
+    ) -> list[str]:
+        if not points_data:
+            return []
+
+        vector_size = len(points_data[0][1])
+        self._ensure_collection(collection, vector_size=vector_size)
+        try:
+            from qdrant_client.models import PointStruct
+        except ImportError as exc:
+            raise RuntimeError("qdrant-client models are unavailable.") from exc
+
+        point_ids = []
+        points = []
+        for point_id, vector, payload in points_data:
+            if len(vector) != vector_size:
+                raise RuntimeError(
+                    f"Batch contains mixed vector sizes: {vector_size} and {len(vector)}."
+                )
+            point_ids.append(str(point_id))
+            points.append(PointStruct(id=str(point_id), vector=vector, payload=payload))
+
+        self.client.upsert(
+            collection_name=collection,
+            points=points,
+        )
+        return point_ids
+
     @staticmethod
     def _scene_point_id(payload: dict[str, Any]) -> str:
         return str(

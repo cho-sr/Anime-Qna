@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import random
 import time
 from pathlib import Path
@@ -17,6 +18,28 @@ JSON_RETRY_PROMPT = (
 )
 
 NO_REASONING_EXTRA_BODY = {"reasoning": {"enabled": False}}
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        print(f"[warn] invalid {name}={value!r}; using {default}")
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        print(f"[warn] invalid {name}={value!r}; using {default}")
+        return default
 
 
 def _content_to_text(content: Any) -> str:
@@ -149,6 +172,9 @@ class HuggingFaceChatClient:
             ) from exc
 
         self.provider = provider
+        timeout = _env_float("HF_CHAT_TIMEOUT", timeout)
+        max_retries = _env_int("HF_CHAT_MAX_RETRIES", max_retries)
+        retry_base_delay = _env_float("HF_CHAT_RETRY_BASE_DELAY", retry_base_delay)
         self.max_retries = max(1, int(max_retries))
         self.retry_base_delay = max(0.1, float(retry_base_delay))
         self.client = OpenAI(
@@ -392,8 +418,15 @@ class VideoVLMClient:
 
 
 class SummaryLLMClient:
-    def __init__(self, token: str, model: str, provider: Optional[str] = None):
+    def __init__(
+        self,
+        token: str,
+        model: str,
+        provider: Optional[str] = None,
+        character_glossary: str = "",
+    ):
         self.model = model
+        self.character_glossary = character_glossary.strip()
         self.chat = HuggingFaceChatClient(token=token, provider=provider)
 
     def summarize_scene(
@@ -405,6 +438,8 @@ class SummaryLLMClient:
             "frame_description": frame_description.to_dict(),
             "shot_subtitles": [segment.to_dict() for segment in shot_subtitles],
         }
+        if self.character_glossary:
+            payload["character_glossary"] = self.character_glossary
         messages = [
             {
                 "role": "system",
@@ -413,6 +448,10 @@ class SummaryLLMClient:
                     "Use only the provided keyframe visual description and overlapping subtitles. "
                     "The output will be used for semantic vector search and keyword/BM25 search, "
                     "so preserve concrete nouns, actions, people, objects, places, and dialogue terms. "
+                    "If a character glossary is provided, use it as allowed character names, aliases, "
+                    "and visual clues. Attach a character name only when the visual description, "
+                    "subtitle, or glossary clue supports it; if uncertain, phrase it as an apparent "
+                    "or subtitle-mentioned character rather than a hard fact. "
                     "Do not invent facts, names, emotions, places, relationships, or story context "
                     "that are not supported by the input. Return only one valid JSON object. "
                     "Do not include markdown or reasoning."
@@ -554,6 +593,224 @@ class SummaryLLMClient:
         return _clip_multiline_text("\n".join(part for part in parts if part), 1800)
 
 
+class UnifiedSceneClient:
+    def __init__(
+        self,
+        token: str,
+        model: str,
+        provider: Optional[str] = None,
+        character_glossary: str = "",
+    ):
+        self.model = model
+        self.character_glossary = character_glossary.strip()
+        self.chat = HuggingFaceChatClient(token=token, provider=provider)
+
+    def summarize_scenes(self, scenes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not scenes:
+            return []
+        try:
+            return self._summarize_scenes_once(scenes)
+        except RuntimeError as exc:
+            if len(scenes) <= 1:
+                raise
+            midpoint = max(1, len(scenes) // 2)
+            print(
+                "[warn] unified scene batch failed; splitting batch "
+                f"size={len(scenes)}: {str(exc).splitlines()[0]}"
+            )
+            return [
+                *self.summarize_scenes(scenes[:midpoint]),
+                *self.summarize_scenes(scenes[midpoint:]),
+            ]
+
+    def _summarize_scenes_once(self, scenes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        content: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": (
+                    "Analyze the following video shots in one API call. For each shot, do "
+                    "the work in two internal passes: first inspect only the keyframe image "
+                    "for visible evidence, then combine that visual evidence with the shot "
+                    "subtitles to produce the final retrieval JSON. Return one result for "
+                    "every input shot_id."
+                ),
+            }
+        ]
+        for scene in scenes:
+            shot = scene["shot"]
+            subtitles = scene.get("shot_subtitles") or []
+            subtitle_rows = [
+                {
+                    "start_time": segment.start_time,
+                    "end_time": segment.end_time,
+                    "text": segment.text,
+                }
+                for segment in subtitles
+            ]
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"SHOT_ID: {shot.shot_id}\n"
+                        f"TIME: {shot.start_time:.2f}-{shot.end_time:.2f}\n"
+                        "PASS_1_INPUT: inspect the next keyframe image only."
+                    ),
+                }
+            )
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": VideoVLMClient._image_data_url(scene["keyframe"].image_path)
+                    },
+                }
+            )
+            content.append(
+                {
+                    "type": "text",
+                    "text": (
+                        "PASS_2_INPUT: now combine the visual evidence from the keyframe "
+                        "with these subtitles for the same shot.\n"
+                        f"SUBTITLES_JSON: {json.dumps(subtitle_rows, ensure_ascii=False)}"
+                    ),
+                }
+            )
+
+        if self.character_glossary:
+            content.append(
+                {
+                    "type": "text",
+                    "text": f"CHARACTER_GLOSSARY:\n{self.character_glossary}",
+                }
+            )
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a multimodal Korean video indexing model. This is a single "
+                    "API request, but you must internally process each shot in two passes. "
+                    "Pass 1: inspect the keyframe image only and derive visible evidence. "
+                    "Pass 2: combine that visible evidence with subtitles and the optional "
+                    "character glossary to produce the final scene JSON. Do not let subtitles "
+                    "change what is visibly present in frame_description. If a name is only "
+                    "implied by subtitles or glossary clues, phrase it conservatively. Do not "
+                    "invent facts, relationships, emotions, places, or names. Return only one "
+                    "valid JSON object."
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    *content,
+                    {
+                        "type": "text",
+                        "text": (
+                            "Return JSON exactly as {\"scenes\": [...]}.\n"
+                            "Each scene object must include:\n"
+                            "- shot_id: integer matching the input\n"
+                            "- frame_description: 1 factual Korean sentence from Pass 1 image-only visible evidence\n"
+                            "- summary: 1-2 Korean sentences combining visible evidence and subtitles\n"
+                            "- action: array of concrete Korean action phrases\n"
+                            "- context: short factual context; empty string if unclear\n"
+                            "- emotion: array of explicitly supported emotions or tones; [] if unclear\n"
+                            "- people: array of visible or mentioned people, roles, names, or descriptions\n"
+                            "- objects: array of important visible or mentioned objects/items\n"
+                            "- places: array of visible or mentioned places/settings\n"
+                            "- visual_keywords: Korean visual search terms and useful synonyms\n"
+                            "- dialogue_keywords: important subtitle terms, names, topics, goals, or events\n"
+                            "- search_text: one Korean string with short newline-separated retrieval lines\n\n"
+                            "Do not output the intermediate two-pass notes. Only output the final JSON. "
+                            "Search_text should use labels such as 요약:, 행동:, 인물:, 사물:, 장소:, "
+                            "화면 키워드:, 대사 키워드:. Never include 없음/해당 없음 lines. "
+                            "Return exactly one JSON object and no markdown. /no_think"
+                        ),
+                    },
+                ],
+            },
+        ]
+        data = self.chat.chat_json(
+            self.model,
+            messages,
+            max_tokens=max(1200, 650 * len(scenes)),
+            response_format={"type": "json_object"},
+            extra_body=NO_REASONING_EXTRA_BODY,
+        )
+        scene_items = data.get("scenes")
+        if not isinstance(scene_items, list):
+            raise RuntimeError("Unified scene model did not return a scenes array.")
+
+        by_id = {}
+        for item in scene_items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                by_id[int(item.get("shot_id"))] = item
+            except (TypeError, ValueError):
+                continue
+
+        results = []
+        for scene in scenes:
+            shot_id = int(scene["shot"].shot_id)
+            item = by_id.get(shot_id)
+            if item is None:
+                raise RuntimeError(f"Unified scene response omitted shot_id={shot_id}.")
+            frame_description = self._frame_description_from_item(item)
+            summary = self._summary_from_item(item, frame_description, scene["shot_subtitles"])
+            results.append(
+                {
+                    "shot": scene["shot"],
+                    "keyframe": scene["keyframe"],
+                    "shot_subtitles": scene["shot_subtitles"],
+                    "frame_description": frame_description,
+                    "summary": summary,
+                }
+            )
+        return results
+
+    @staticmethod
+    def _frame_description_from_item(item: dict[str, Any]) -> FrameDescription:
+        return FrameDescription(
+            frame_description=ensure_str(
+                item.get("frame_description") or item.get("description") or item.get("summary")
+            ),
+            visible_objects=_unique_str_list(item.get("objects") or item.get("visible_objects"), limit=12),
+            visible_actions=_unique_str_list(item.get("action") or item.get("visible_actions"), limit=12),
+            people=_unique_str_list(item.get("people"), limit=12),
+            setting=ensure_str(item.get("setting") or item.get("context")),
+            visible_text=_unique_str_list(item.get("visible_text"), limit=12),
+            visual_keywords=_unique_str_list(item.get("visual_keywords"), limit=20),
+        )
+
+    @staticmethod
+    def _summary_from_item(
+        item: dict[str, Any],
+        frame_description: FrameDescription,
+        shot_subtitles: list[SubtitleSegment],
+    ) -> SceneSummary:
+        summary = SceneSummary(
+            summary=ensure_str(item.get("summary")),
+            action=_unique_str_list(item.get("action"), limit=12),
+            context=ensure_str(item.get("context")),
+            emotion=_unique_str_list(item.get("emotion"), limit=8),
+            people=_unique_str_list(item.get("people"), limit=15),
+            objects=_unique_str_list(item.get("objects"), limit=20),
+            places=_unique_str_list(item.get("places"), limit=12),
+            visual_keywords=_unique_str_list(item.get("visual_keywords"), limit=25),
+            dialogue_keywords=_unique_str_list(item.get("dialogue_keywords"), limit=25),
+            search_text=_clean_search_text(item.get("search_text")),
+        )
+        if not summary.summary:
+            return SummaryLLMClient.fallback_summary(frame_description, shot_subtitles)
+        if not summary.search_text:
+            summary.search_text = SummaryLLMClient.search_text_from_summary(
+                summary,
+                frame_description,
+                shot_subtitles,
+            )
+        return summary
+
+
 class RAGLLMClient:
     def __init__(self, token: str, model: str, provider: Optional[str] = None):
         self.model = model
@@ -629,4 +886,113 @@ class RAGLLMClient:
                 ),
             },
         ]
-        return self.chat.chat_text(self.model, messages, max_tokens=1100, temperature=0.2)
+        try:
+            answer = self.chat.chat_text(self.model, messages, max_tokens=1100, temperature=0.2)
+        except Exception as exc:
+            print(f"[warn] RAG answer generation failed; using fallback answer: {exc}")
+            return self.fallback_answer(sources)
+
+        answer = ensure_str(answer)
+        if answer:
+            return answer
+
+        print("[warn] RAG answer generation returned empty text; using fallback answer.")
+        return self.fallback_answer(sources)
+
+    @staticmethod
+    def fallback_answer(sources: list[dict[str, Any]]) -> str:
+        if not sources:
+            return "저장된 영상 정보에서 질문과 관련된 내용을 찾기 어렵습니다."
+
+        lines = ["검색된 장면 기준으로는 다음 내용이 관련 있어 보입니다:"]
+        for source in sources[:3]:
+            timestamp = ensure_str(source.get("timestamp")) or "시간 정보 없음"
+            summary = ensure_str(source.get("summary")) or ensure_str(source.get("frame_description"))
+            if not summary:
+                summary = "요약 정보가 부족한 장면입니다."
+            lines.append(f"- {timestamp}: {_clip_text(summary, 220)}")
+        return "\n".join(lines)
+
+
+class VideoEntitySweepClient:
+    def __init__(self, token: str, model: str, provider: Optional[str] = None):
+        self.model = model
+        self.chat = HuggingFaceChatClient(token=token, provider=provider)
+
+    def infer_candidates(self, scenes: list[dict[str, Any]]) -> dict[str, Any]:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You infer recurring character or person identity candidates from indexed "
+                    "video scene metadata. Use only the provided scene summaries, visual "
+                    "descriptions, people fields, keywords, and subtitles. Do not use outside "
+                    "knowledge. Return only valid JSON."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Extract recurring named or strongly identifiable characters. Prefer real "
+                    "names and aliases from subtitles. If a name is absent, include a stable "
+                    "descriptive label only when the same visual identity appears repeatedly. "
+                    "Return JSON exactly as {\"characters\": [...]}. Each character object must "
+                    "have: canonical_name, aliases, visual_clues, evidence_shot_ids, confidence "
+                    "(low/medium/high). Keep only candidates supported by evidence.\n\n"
+                    f"SCENES_JSON:\n{json.dumps(scenes, ensure_ascii=False)}"
+                ),
+            },
+        ]
+        return self.chat.chat_json(self.model, messages, max_tokens=1800)
+
+    def merge_candidates(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You merge character identity candidates extracted from chunks of one video. "
+                    "Use only the provided candidates. Deduplicate aliases and evidence. "
+                    "Return only valid JSON."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Merge duplicate candidates and keep conservative evidence. Return JSON "
+                    "exactly as {\"characters\": [...]}. Each character object must have: "
+                    "canonical_name, aliases, visual_clues, evidence_shot_ids, confidence "
+                    "(low/medium/high). Do not add names that are not present in candidates.\n\n"
+                    f"CANDIDATES_JSON:\n{json.dumps(candidates, ensure_ascii=False)}"
+                ),
+            },
+        ]
+        return self.chat.chat_json(self.model, messages, max_tokens=2200)
+
+    def assign_entities(
+        self,
+        entities: dict[str, Any],
+        scenes: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You assign known video character candidates to scene records. Use only "
+                    "the provided entity list and scene evidence. Be conservative: assign a "
+                    "name only when subtitles mention it or visual clues match. Return only "
+                    "valid JSON."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "For each scene with enough evidence, return an assignment. Return JSON "
+                    "exactly as {\"assignments\": [...]}. Each assignment must have: shot_id, "
+                    "names, evidence, confidence (low/medium/high). Omit scenes with no useful "
+                    "assignment.\n\n"
+                    f"ENTITIES_JSON:\n{json.dumps(entities, ensure_ascii=False)}\n\n"
+                    f"SCENES_JSON:\n{json.dumps(scenes, ensure_ascii=False)}"
+                ),
+            },
+        ]
+        return self.chat.chat_json(self.model, messages, max_tokens=2200)

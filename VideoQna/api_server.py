@@ -35,7 +35,7 @@ def default_qdrant_path() -> Path:
 
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
-    collection: str = "video_qna"
+    collection: str = "video_qna_qwen06b"
 
 
 class Source(BaseModel):
@@ -59,6 +59,7 @@ class Source(BaseModel):
     places: list[Any] = Field(default_factory=list)
     visual_keywords: list[Any] = Field(default_factory=list)
     dialogue_keywords: list[Any] = Field(default_factory=list)
+    character_candidates: list[Any] = Field(default_factory=list)
     search_text: str = ""
     frame_description: str = ""
     subtitles: list[dict[str, Any]] = Field(default_factory=list)

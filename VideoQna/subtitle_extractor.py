@@ -15,12 +15,16 @@ class WhisperSubtitleExtractor:
         device: str = "auto",
         compute_type: str = "auto",
         vad_filter: bool = False,
+        beam_size: int = 5,
+        initial_prompt: str = "",
     ):
         self.model_size = model_size
         self.language = language
         self.device = device
         self.compute_type = compute_type
         self.vad_filter = vad_filter
+        self.beam_size = max(1, int(beam_size or 1))
+        self.initial_prompt = initial_prompt.strip()
         self._model = None
 
     def _load_model(self):
@@ -83,7 +87,8 @@ class WhisperSubtitleExtractor:
         return self._model.transcribe(
             str(video_path),
             language=self.language,
-            beam_size=5,
+            beam_size=self.beam_size,
+            initial_prompt=self.initial_prompt or None,
             vad_filter=vad_filter,
         )
 

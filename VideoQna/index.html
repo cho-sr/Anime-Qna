@@ -348,7 +348,7 @@
 
         <div class="field">
           <label for="collection">Collection</label>
-          <input id="collection" name="collection" value="video_qna" autocomplete="off">
+          <input id="collection" name="collection" value="video_qna_qwen06b" autocomplete="off">
         </div>
 
         <button id="submitButton" class="submit" type="submit">질문하기</button>
@@ -519,7 +519,7 @@
 
       const payload = {
         question: document.getElementById("question").value.trim(),
-        collection: document.getElementById("collection").value.trim() || "video_qna"
+        collection: document.getElementById("collection").value.trim() || "video_qna_qwen06b"
       };
 
       try {

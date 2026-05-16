@@ -48,6 +48,11 @@ def payload_to_search_text(payload: dict[str, Any]) -> str:
         " ".join(ensure_str_list(payload.get("places"))),
         " ".join(ensure_str_list(payload.get("visual_keywords"))),
         " ".join(ensure_str_list(payload.get("dialogue_keywords"))),
+        " ".join(
+            " ".join(ensure_str_list(candidate.get("names")) + [ensure_str(candidate.get("evidence"))])
+            for candidate in payload.get("character_candidates") or []
+            if isinstance(candidate, dict)
+        ),
         ensure_str(payload.get("frame_description")),
         " ".join(subtitle_texts),
     ]
@@ -98,6 +103,7 @@ def payload_to_source(
         "places": payload.get("places") or [],
         "visual_keywords": payload.get("visual_keywords") or [],
         "dialogue_keywords": payload.get("dialogue_keywords") or [],
+        "character_candidates": payload.get("character_candidates") or [],
         "search_text": payload.get("search_text") or "",
         "frame_description": payload.get("frame_description") or "",
         "subtitles": subtitle_texts,

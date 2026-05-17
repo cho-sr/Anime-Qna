@@ -1213,6 +1213,44 @@ def cmd_entities(args: argparse.Namespace) -> None:
         compact_scenes = [compact_scene_for_entities(record) for record in records]
         compact_scenes = [scene for scene in compact_scenes if scene.get("shot_id") is not None]
 
+        def infer_candidate_batches(batch: list[dict]) -> list[dict]:
+            try:
+                data = entity_client.infer_candidates(batch)
+                return [{"characters": normalize_entity_candidates(data)}]
+            except RuntimeError as exc:
+                if len(batch) <= 1:
+                    raise
+                midpoint = max(1, len(batch) // 2)
+                print(
+                    "[warn] entity candidate chunk failed; splitting "
+                    f"size={len(batch)} -> {midpoint}+{len(batch) - midpoint}: "
+                    f"{str(exc).splitlines()[0]}",
+                    flush=True,
+                )
+                return [
+                    *infer_candidate_batches(batch[:midpoint]),
+                    *infer_candidate_batches(batch[midpoint:]),
+                ]
+
+        def assign_entity_batches(batch: list[dict]) -> list[dict[int, list[dict]]]:
+            try:
+                data = entity_client.assign_entities(entities, batch)
+                return [normalize_entity_assignments(data)]
+            except RuntimeError as exc:
+                if len(batch) <= 1:
+                    raise
+                midpoint = max(1, len(batch) // 2)
+                print(
+                    "[warn] entity assignment chunk failed; splitting "
+                    f"size={len(batch)} -> {midpoint}+{len(batch) - midpoint}: "
+                    f"{str(exc).splitlines()[0]}",
+                    flush=True,
+                )
+                return [
+                    *assign_entity_batches(batch[:midpoint]),
+                    *assign_entity_batches(batch[midpoint:]),
+                ]
+
         candidate_batches = []
         with timer.step("entity_candidate_sweep", scenes=len(compact_scenes), chunk_size=args.entity_chunk_size):
             for batch in tqdm(
@@ -1220,8 +1258,7 @@ def cmd_entities(args: argparse.Namespace) -> None:
                 desc="entity-candidates",
                 unit="chunk",
             ):
-                data = entity_client.infer_candidates(batch)
-                candidate_batches.append({"characters": normalize_entity_candidates(data)})
+                candidate_batches.extend(infer_candidate_batches(batch))
 
         all_candidates = [
             character
@@ -1250,8 +1287,7 @@ def cmd_entities(args: argparse.Namespace) -> None:
                     desc="entity-assign",
                     unit="chunk",
                 ):
-                    data = entity_client.assign_entities(entities, batch)
-                    assignment_maps.append(normalize_entity_assignments(data))
+                    assignment_maps.extend(assign_entity_batches(batch))
             assignments_by_shot = merge_assignment_maps(assignment_maps)
             assignment_rows = [
                 {"shot_id": shot_id, "assignments": assignments}

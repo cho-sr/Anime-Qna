@@ -938,12 +938,15 @@ class VideoEntitySweepClient:
                     "descriptive label only when the same visual identity appears repeatedly. "
                     "Return JSON exactly as {\"characters\": [...]}. Each character object must "
                     "have: canonical_name, aliases, visual_clues, evidence_shot_ids, confidence "
-                    "(low/medium/high). Keep only candidates supported by evidence.\n\n"
+                    "(low/medium/high). Keep only candidates supported by evidence. Return at "
+                    "most 8 characters for this chunk. Keep aliases and visual_clues as short "
+                    "arrays of strings, and keep evidence_shot_ids to the strongest shots only.\n\n"
                     f"SCENES_JSON:\n{json.dumps(scenes, ensure_ascii=False)}"
                 ),
             },
         ]
-        return self.chat.chat_json(self.model, messages, max_tokens=1800)
+        max_tokens = min(6000, max(2200, 1000 + 90 * len(scenes)))
+        return self.chat.chat_json(self.model, messages, max_tokens=max_tokens)
 
     def merge_candidates(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
         messages = [
@@ -961,12 +964,14 @@ class VideoEntitySweepClient:
                     "Merge duplicate candidates and keep conservative evidence. Return JSON "
                     "exactly as {\"characters\": [...]}. Each character object must have: "
                     "canonical_name, aliases, visual_clues, evidence_shot_ids, confidence "
-                    "(low/medium/high). Do not add names that are not present in candidates.\n\n"
+                    "(low/medium/high). Do not add names that are not present in candidates. "
+                    "Return at most 24 final characters, and keep each field concise.\n\n"
                     f"CANDIDATES_JSON:\n{json.dumps(candidates, ensure_ascii=False)}"
                 ),
             },
         ]
-        return self.chat.chat_json(self.model, messages, max_tokens=2200)
+        max_tokens = min(7000, max(2600, 800 + 90 * len(candidates)))
+        return self.chat.chat_json(self.model, messages, max_tokens=max_tokens)
 
     def assign_entities(
         self,
@@ -989,10 +994,11 @@ class VideoEntitySweepClient:
                     "For each scene with enough evidence, return an assignment. Return JSON "
                     "exactly as {\"assignments\": [...]}. Each assignment must have: shot_id, "
                     "names, evidence, confidence (low/medium/high). Omit scenes with no useful "
-                    "assignment.\n\n"
+                    "assignment. Keep evidence to one short sentence.\n\n"
                     f"ENTITIES_JSON:\n{json.dumps(entities, ensure_ascii=False)}\n\n"
                     f"SCENES_JSON:\n{json.dumps(scenes, ensure_ascii=False)}"
                 ),
             },
         ]
-        return self.chat.chat_json(self.model, messages, max_tokens=2200)
+        max_tokens = min(7000, max(2600, 900 + 80 * len(scenes)))
+        return self.chat.chat_json(self.model, messages, max_tokens=max_tokens)

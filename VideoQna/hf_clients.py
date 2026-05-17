@@ -946,7 +946,13 @@ class VideoEntitySweepClient:
             },
         ]
         max_tokens = min(6000, max(2200, 1000 + 90 * len(scenes)))
-        return self.chat.chat_json(self.model, messages, max_tokens=max_tokens)
+        return self.chat.chat_json(
+            self.model,
+            messages,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+            extra_body=NO_REASONING_EXTRA_BODY,
+        )
 
     def merge_candidates(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
         messages = [
@@ -971,7 +977,13 @@ class VideoEntitySweepClient:
             },
         ]
         max_tokens = min(7000, max(2600, 800 + 90 * len(candidates)))
-        return self.chat.chat_json(self.model, messages, max_tokens=max_tokens)
+        return self.chat.chat_json(
+            self.model,
+            messages,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+            extra_body=NO_REASONING_EXTRA_BODY,
+        )
 
     def assign_entities(
         self,
@@ -1001,4 +1013,10 @@ class VideoEntitySweepClient:
             },
         ]
         max_tokens = min(7000, max(2600, 900 + 80 * len(scenes)))
-        return self.chat.chat_json(self.model, messages, max_tokens=max_tokens)
+        return self.chat.chat_json(
+            self.model,
+            messages,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+            extra_body=NO_REASONING_EXTRA_BODY,
+        )

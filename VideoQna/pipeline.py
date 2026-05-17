@@ -202,6 +202,68 @@ def normalize_entity_candidates(entity_data: dict) -> list[dict]:
     return normalized
 
 
+def merge_entity_candidates_locally(candidates: list[dict], max_candidates: int = 24) -> list[dict]:
+    confidence_rank = {"low": 0, "medium": 1, "high": 2}
+    merged: list[dict] = []
+
+    def aliases_for(candidate: dict) -> set[str]:
+        values = [candidate.get("canonical_name"), *ensure_str_list(candidate.get("aliases"))]
+        return {
+            " ".join(ensure_str(value).split()).casefold()
+            for value in values
+            if ensure_str(value)
+        }
+
+    for candidate in normalize_entity_candidates({"characters": candidates}):
+        candidate_aliases = aliases_for(candidate)
+        target = None
+        for existing in merged:
+            if candidate_aliases & aliases_for(existing):
+                target = existing
+                break
+
+        if target is None:
+            merged.append(candidate)
+            continue
+
+        existing_aliases = {
+            " ".join(alias.split()).casefold()
+            for alias in ensure_str_list(target.get("aliases"))
+        }
+        aliases = ensure_str_list(target.get("aliases"))
+        for alias in ensure_str_list(candidate.get("aliases")) + [candidate["canonical_name"]]:
+            alias_key = " ".join(alias.split()).casefold()
+            if alias_key and alias_key not in existing_aliases and alias_key != target["canonical_name"].casefold():
+                existing_aliases.add(alias_key)
+                aliases.append(alias)
+        target["aliases"] = aliases[:12]
+
+        clues = ensure_str_list(target.get("visual_clues"))
+        seen_clues = {" ".join(clue.split()).casefold() for clue in clues}
+        for clue in ensure_str_list(candidate.get("visual_clues")):
+            clue_key = " ".join(clue.split()).casefold()
+            if clue_key and clue_key not in seen_clues:
+                seen_clues.add(clue_key)
+                clues.append(clue)
+        target["visual_clues"] = clues[:16]
+
+        shot_ids = set(target.get("evidence_shot_ids") or [])
+        shot_ids.update(candidate.get("evidence_shot_ids") or [])
+        target["evidence_shot_ids"] = sorted(shot_ids)[:80]
+
+        if confidence_rank.get(candidate.get("confidence"), 1) > confidence_rank.get(target.get("confidence"), 1):
+            target["confidence"] = candidate.get("confidence") or target.get("confidence") or "medium"
+
+    merged.sort(
+        key=lambda item: (
+            -len(item.get("evidence_shot_ids") or []),
+            -confidence_rank.get(item.get("confidence"), 1),
+            ensure_str(item.get("canonical_name")).casefold(),
+        )
+    )
+    return merged[:max_candidates]
+
+
 def normalize_entity_assignments(assignment_data: dict) -> dict[int, list[dict]]:
     assignments = assignment_data.get("assignments") if isinstance(assignment_data, dict) else []
     if not isinstance(assignments, list):
@@ -1213,13 +1275,43 @@ def cmd_entities(args: argparse.Namespace) -> None:
         compact_scenes = [compact_scene_for_entities(record) for record in records]
         compact_scenes = [scene for scene in compact_scenes if scene.get("shot_id") is not None]
 
+        failed_candidate_chunks_path = run_dir / "entity_failed_candidate_chunks.jsonl"
+        failed_assignment_chunks_path = run_dir / "entity_failed_assignment_chunks.jsonl"
+        candidate_batches_path = run_dir / "entity_candidate_batches.json"
+
+        def should_skip_entity_chunk(batch: list[dict], exc: RuntimeError) -> bool:
+            message = str(exc).casefold()
+            return len(batch) <= 1 or (
+                len(batch) <= 5
+                and (
+                    "empty response" in message
+                    or "did not return valid json" in message
+                )
+            )
+
+        def failed_chunk_record(batch: list[dict], exc: RuntimeError) -> dict:
+            shot_ids = [scene.get("shot_id") for scene in batch if scene.get("shot_id") is not None]
+            return {
+                "shot_ids": shot_ids,
+                "size": len(batch),
+                "error": str(exc).splitlines()[0],
+            }
+
         def infer_candidate_batches(batch: list[dict]) -> list[dict]:
             try:
                 data = entity_client.infer_candidates(batch)
                 return [{"characters": normalize_entity_candidates(data)}]
             except RuntimeError as exc:
-                if len(batch) <= 1:
-                    raise
+                if should_skip_entity_chunk(batch, exc):
+                    append_jsonl(failed_candidate_chunks_path, failed_chunk_record(batch, exc))
+                    print(
+                        "[warn] entity candidate chunk skipped "
+                        f"size={len(batch)} shots="
+                        f"{[scene.get('shot_id') for scene in batch]}: "
+                        f"{str(exc).splitlines()[0]}",
+                        flush=True,
+                    )
+                    return []
                 midpoint = max(1, len(batch) // 2)
                 print(
                     "[warn] entity candidate chunk failed; splitting "
@@ -1237,8 +1329,16 @@ def cmd_entities(args: argparse.Namespace) -> None:
                 data = entity_client.assign_entities(entities, batch)
                 return [normalize_entity_assignments(data)]
             except RuntimeError as exc:
-                if len(batch) <= 1:
-                    raise
+                if should_skip_entity_chunk(batch, exc):
+                    append_jsonl(failed_assignment_chunks_path, failed_chunk_record(batch, exc))
+                    print(
+                        "[warn] entity assignment chunk skipped "
+                        f"size={len(batch)} shots="
+                        f"{[scene.get('shot_id') for scene in batch]}: "
+                        f"{str(exc).splitlines()[0]}",
+                        flush=True,
+                    )
+                    return []
                 midpoint = max(1, len(batch) // 2)
                 print(
                     "[warn] entity assignment chunk failed; splitting "
@@ -1251,14 +1351,21 @@ def cmd_entities(args: argparse.Namespace) -> None:
                     *assign_entity_batches(batch[midpoint:]),
                 ]
 
-        candidate_batches = []
-        with timer.step("entity_candidate_sweep", scenes=len(compact_scenes), chunk_size=args.entity_chunk_size):
-            for batch in tqdm(
-                list(chunked(compact_scenes, args.entity_chunk_size)),
-                desc="entity-candidates",
-                unit="chunk",
-            ):
-                candidate_batches.extend(infer_candidate_batches(batch))
+        if candidate_batches_path.exists():
+            with timer.step("load_entity_candidate_batches", source=str(candidate_batches_path)):
+                candidate_batches = read_json(candidate_batches_path)
+                if not isinstance(candidate_batches, list):
+                    candidate_batches = []
+        else:
+            candidate_batches = []
+            with timer.step("entity_candidate_sweep", scenes=len(compact_scenes), chunk_size=args.entity_chunk_size):
+                for batch in tqdm(
+                    list(chunked(compact_scenes, args.entity_chunk_size)),
+                    desc="entity-candidates",
+                    unit="chunk",
+                ):
+                    candidate_batches.extend(infer_candidate_batches(batch))
+                    write_json(candidate_batches_path, candidate_batches)
 
         all_candidates = [
             character
@@ -1268,14 +1375,8 @@ def cmd_entities(args: argparse.Namespace) -> None:
         with timer.step("entity_candidate_merge", candidates=len(all_candidates)):
             if not all_candidates:
                 entities = {"characters": []}
-            elif len(candidate_batches) == 1:
-                entities = {"characters": all_candidates}
             else:
-                entities = {
-                    "characters": normalize_entity_candidates(
-                        entity_client.merge_candidates(all_candidates)
-                    )
-                }
+                entities = {"characters": merge_entity_candidates_locally(all_candidates)}
             write_json(run_dir / "video_entities.json", entities)
             print(f"[entities] candidates={len(entities['characters'])}")
 

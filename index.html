@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VideoQna</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f7f4;
+      --surface: #ffffff;
+      --surface-2: #efeee8;
+      --text: #202124;
+      --muted: #696d73;
+      --line: #d8d6cf;
+      --accent: #256f5b;
+      --accent-2: #9a5b25;
+      --danger: #a33a3a;
+      --shadow: 0 12px 30px rgba(24, 29, 35, 0.08);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+    }
+
+    button,
+    input,
+    textarea {
+      font: inherit;
+    }
+
+    .shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: minmax(280px, 390px) minmax(0, 1fr);
+    }
+
+    .sidebar {
+      border-right: 1px solid var(--line);
+      background: var(--surface);
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 22px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: 24px;
+      line-height: 1.1;
+      letter-spacing: 0;
+    }
+
+    .status {
+      min-width: 78px;
+      height: 30px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .status[data-state="ready"] {
+      color: var(--accent);
+      border-color: rgba(37, 111, 91, 0.35);
+      background: rgba(37, 111, 91, 0.07);
+    }
+
+    .status[data-state="error"] {
+      color: var(--danger);
+      border-color: rgba(163, 58, 58, 0.35);
+      background: rgba(163, 58, 58, 0.07);
+    }
+
+    .field {
+      display: grid;
+      gap: 7px;
+    }
+
+    label {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    input,
+    textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      outline: none;
+      padding: 11px 12px;
+    }
+
+    textarea {
+      min-height: 142px;
+      resize: vertical;
+      line-height: 1.5;
+    }
+
+    input:focus,
+    textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(37, 111, 91, 0.14);
+    }
+
+    .grid-3 {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .checks {
+      display: grid;
+      gap: 8px;
+    }
+
+    .check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 650;
+    }
+
+    .check input {
+      width: 16px;
+      height: 16px;
+      accent-color: var(--accent);
+    }
+
+    .submit {
+      border: 0;
+      border-radius: 8px;
+      background: var(--accent);
+      color: white;
+      min-height: 44px;
+      padding: 0 16px;
+      font-weight: 750;
+      cursor: pointer;
+      box-shadow: var(--shadow);
+    }
+
+    .submit:disabled {
+      cursor: wait;
+      opacity: 0.65;
+    }
+
+    .main {
+      min-width: 0;
+      padding: 28px;
+      display: grid;
+      gap: 22px;
+      align-content: start;
+    }
+
+    .answer-panel,
+    .debug-panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel-head {
+      min-height: 52px;
+      padding: 14px 18px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .panel-head h2 {
+      margin: 0;
+      font-size: 16px;
+      letter-spacing: 0;
+    }
+
+    .answer {
+      padding: 18px;
+      white-space: pre-wrap;
+      line-height: 1.65;
+      min-height: 132px;
+    }
+
+    .placeholder {
+      color: var(--muted);
+    }
+
+    .meta-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 0 18px 18px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      padding: 0 10px;
+      color: var(--muted);
+      background: var(--surface-2);
+      font-size: 13px;
+      word-break: break-word;
+    }
+
+    .sources {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 14px;
+    }
+
+    .source {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: var(--shadow);
+    }
+
+    .thumb {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #222;
+      object-fit: cover;
+      display: block;
+    }
+
+    .thumb-missing {
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      display: grid;
+      place-items: center;
+      background: #242629;
+      color: #e8e5dd;
+      font-size: 13px;
+    }
+
+    .source-body {
+      padding: 14px;
+      display: grid;
+      gap: 10px;
+    }
+
+    .source-title {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 14px;
+      font-weight: 760;
+    }
+
+    .score {
+      color: var(--accent-2);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+
+    .source p {
+      margin: 0;
+      color: var(--text);
+      line-height: 1.48;
+      font-size: 14px;
+    }
+
+    .chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    details {
+      border-top: 1px solid var(--line);
+      padding-top: 10px;
+    }
+
+    summary {
+      cursor: pointer;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    pre {
+      margin: 12px 0 0;
+      padding: 14px;
+      overflow: auto;
+      max-height: 360px;
+      border-radius: 8px;
+      background: #202124;
+      color: #f3f1ec;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .error {
+      color: var(--danger);
+    }
+
+    @media (max-width: 860px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .main {
+        padding: 18px;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .grid-3 {
+        grid-template-columns: 1fr;
+      }
+
+      .brand {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <h1>VideoQna</h1>
+        <span id="health" class="status">확인 중</span>
+      </div>
+
+      <form id="askForm">
+        <div class="field">
+          <label for="question">Question</label>
+          <textarea id="question" name="question" required>주인공이 놀라는 장면은?</textarea>
+        </div>
+
+        <div class="field">
+          <label for="collection">Collection</label>
+          <input id="collection" name="collection" value="video_qna_qwen06b" autocomplete="off">
+        </div>
+
+        <div class="grid-3">
+          <div class="field">
+            <label for="topK">Top K</label>
+            <input id="topK" name="topK" type="number" min="1" max="20" value="4">
+          </div>
+          <div class="field">
+            <label for="denseTopK">Dense</label>
+            <input id="denseTopK" name="denseTopK" type="number" min="1" max="200" value="20">
+          </div>
+          <div class="field">
+            <label for="bm25TopK">BM25</label>
+            <input id="bm25TopK" name="bm25TopK" type="number" min="1" max="200" value="20">
+          </div>
+        </div>
+
+        <div class="checks">
+          <label class="check" for="useExpansion">
+            <input id="useExpansion" name="useExpansion" type="checkbox" checked>
+            LLM expansion
+          </label>
+          <label class="check" for="generateAnswer">
+            <input id="generateAnswer" name="generateAnswer" type="checkbox" checked>
+            LLM answer
+          </label>
+        </div>
+
+        <button id="submitButton" class="submit" type="submit">질문하기</button>
+      </form>
+    </aside>
+
+    <main class="main">
+      <section class="answer-panel">
+        <div class="panel-head">
+          <h2>Answer</h2>
+          <span id="elapsed" class="pill">대기</span>
+        </div>
+        <div id="answer" class="answer placeholder">질문을 보내면 답변이 여기에 표시됩니다.</div>
+        <div id="expansions" class="meta-row"></div>
+      </section>
+
+      <section>
+        <div class="panel-head">
+          <h2>Sources</h2>
+          <span id="sourceCount" class="pill">0</span>
+        </div>
+        <div id="sources" class="sources"></div>
+      </section>
+
+      <section class="debug-panel">
+        <div class="panel-head">
+          <h2>Retrieval Debug</h2>
+          <span id="debugState" class="pill">비어 있음</span>
+        </div>
+        <details>
+          <summary>dense / bm25 / rrf</summary>
+          <pre id="debug">{}</pre>
+        </details>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const form = document.getElementById("askForm");
+    const health = document.getElementById("health");
+    const answerEl = document.getElementById("answer");
+    const expansionsEl = document.getElementById("expansions");
+    const sourcesEl = document.getElementById("sources");
+    const sourceCountEl = document.getElementById("sourceCount");
+    const debugEl = document.getElementById("debug");
+    const debugStateEl = document.getElementById("debugState");
+    const elapsedEl = document.getElementById("elapsed");
+    const submitButton = document.getElementById("submitButton");
+
+    function mediaUrl(path) {
+      if (!path) return "";
+      return `/media/keyframe?path=${encodeURIComponent(path)}`;
+    }
+
+    function text(value, fallback = "") {
+      if (value === null || value === undefined) return fallback;
+      return String(value);
+    }
+
+    function chip(label) {
+      const span = document.createElement("span");
+      span.className = "pill";
+      span.textContent = label;
+      return span;
+    }
+
+    function renderMeta(result) {
+      expansionsEl.replaceChildren();
+      for (const query of result.expanded_queries || []) {
+        expansionsEl.appendChild(chip(`확장: ${query}`));
+      }
+      for (const keyword of result.keywords || []) {
+        expansionsEl.appendChild(chip(`#${keyword}`));
+      }
+    }
+
+    function renderSources(sources) {
+      sourcesEl.replaceChildren();
+      sourceCountEl.textContent = String(sources.length);
+
+      for (const source of sources) {
+        const article = document.createElement("article");
+        article.className = "source";
+
+        if (source.image_path) {
+          const img = document.createElement("img");
+          img.className = "thumb";
+          img.alt = `shot ${text(source.shot_id, "")}`;
+          img.src = mediaUrl(source.image_path);
+          img.onerror = () => {
+            const missing = document.createElement("div");
+            missing.className = "thumb-missing";
+            missing.textContent = "이미지를 불러올 수 없음";
+            img.replaceWith(missing);
+          };
+          article.appendChild(img);
+        } else {
+          const missing = document.createElement("div");
+          missing.className = "thumb-missing";
+          missing.textContent = "keyframe 없음";
+          article.appendChild(missing);
+        }
+
+        const body = document.createElement("div");
+        body.className = "source-body";
+
+        const title = document.createElement("div");
+        title.className = "source-title";
+        title.innerHTML = `<span>#${source.rank} Shot ${text(source.shot_id, "-")} · ${text(source.timestamp)}</span><span class="score">RRF ${Number(source.rrf_score || 0).toFixed(4)}</span>`;
+        body.appendChild(title);
+
+        const summary = document.createElement("p");
+        summary.textContent = text(source.summary, "summary 없음");
+        body.appendChild(summary);
+
+        const chips = document.createElement("div");
+        chips.className = "chips";
+        for (const action of source.action || []) chips.appendChild(chip(`action: ${action}`));
+        for (const emotion of source.emotion || []) chips.appendChild(chip(`emotion: ${emotion}`));
+        body.appendChild(chips);
+
+        const detail = document.createElement("details");
+        const summaryLabel = document.createElement("summary");
+        summaryLabel.textContent = "payload";
+        detail.appendChild(summaryLabel);
+        const pre = document.createElement("pre");
+        pre.textContent = JSON.stringify({
+          context: source.context,
+          frame_description: source.frame_description,
+          subtitles: source.subtitles,
+          dense_score: source.dense_score,
+          bm25_score: source.bm25_score,
+          image_path: source.image_path
+        }, null, 2);
+        detail.appendChild(pre);
+        body.appendChild(detail);
+
+        article.appendChild(body);
+        sourcesEl.appendChild(article);
+      }
+    }
+
+    async function checkHealth() {
+      try {
+        const response = await fetch("/health");
+        if (!response.ok) throw new Error(response.statusText);
+        health.textContent = "ready";
+        health.dataset.state = "ready";
+      } catch (error) {
+        health.textContent = "error";
+        health.dataset.state = "error";
+      }
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const started = performance.now();
+      submitButton.disabled = true;
+      submitButton.textContent = "검색 중";
+      elapsedEl.textContent = "실행 중";
+      answerEl.className = "answer placeholder";
+      answerEl.textContent = "검색과 답변 생성을 진행 중입니다.";
+      expansionsEl.replaceChildren();
+      sourcesEl.replaceChildren();
+      sourceCountEl.textContent = "0";
+      debugEl.textContent = "{}";
+      debugStateEl.textContent = "실행 중";
+
+      const payload = {
+        question: document.getElementById("question").value.trim(),
+        collection: document.getElementById("collection").value.trim() || "video_qna_qwen06b",
+        top_k: Number(document.getElementById("topK").value || 4),
+        dense_top_k: Number(document.getElementById("denseTopK").value || 20),
+        bm25_top_k: Number(document.getElementById("bm25TopK").value || 20),
+        use_llm_query_expansion: document.getElementById("useExpansion").checked,
+        generate_answer: document.getElementById("generateAnswer").checked
+      };
+
+      try {
+        const response = await fetch("/ask", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(payload)
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
+        }
+
+        answerEl.className = "answer";
+        answerEl.textContent = data.answer || "답변 없음";
+        renderMeta(data);
+        renderSources(data.sources || []);
+        debugEl.textContent = JSON.stringify(data.retrieval_debug || {}, null, 2);
+        debugStateEl.textContent = "완료";
+      } catch (error) {
+        answerEl.className = "answer error";
+        answerEl.textContent = error.message || "요청 실패";
+        debugStateEl.textContent = "오류";
+      } finally {
+        const elapsed = ((performance.now() - started) / 1000).toFixed(1);
+        elapsedEl.textContent = `${elapsed}s`;
+        submitButton.disabled = false;
+        submitButton.textContent = "질문하기";
+      }
+    });
+
+    checkHealth();
+  </script>
+</body>
+</html>

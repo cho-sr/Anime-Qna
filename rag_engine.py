@@ -653,6 +653,8 @@ class HybridRAGEngine:
         local_embedding_batch_size: int = 8,
         local_embedding_max_length: int = 2048,
         store: QdrantSummaryStore | None = None,
+        embedder: Any | None = None,
+        llm: RAGLLMClient | None = None,
     ):
         if not hf_token:
             raise RuntimeError("HF_TOKEN is required for RAG query expansion and answers.")
@@ -665,7 +667,7 @@ class HybridRAGEngine:
         self.local_embedding_batch_size = int(local_embedding_batch_size or 8)
         self.local_embedding_max_length = int(local_embedding_max_length or 2048)
         self.store = store or QdrantSummaryStore(qdrant_path=qdrant_path)
-        self.embedder = create_summary_embedder(
+        self.embedder = embedder or create_summary_embedder(
             backend=self.embedding_backend,
             model_name=embedding_model,
             token=hf_token,
@@ -674,7 +676,7 @@ class HybridRAGEngine:
             local_batch_size=self.local_embedding_batch_size,
             local_max_length=self.local_embedding_max_length,
         )
-        self.llm = RAGLLMClient(token=hf_token, model=llm_model, provider=llm_provider or hf_provider)
+        self.llm = llm or RAGLLMClient(token=hf_token, model=llm_model, provider=llm_provider or hf_provider)
         self._collection_cache: dict[str, dict[str, Any]] = {}
 
     @classmethod
@@ -682,6 +684,8 @@ class HybridRAGEngine:
         cls,
         qdrant_path: str | Path,
         store: QdrantSummaryStore | None = None,
+        embedder: Any | None = None,
+        llm: RAGLLMClient | None = None,
     ) -> "HybridRAGEngine":
         hf_provider = os.getenv("HF_PROVIDER") or None
         embedding_backend = (os.getenv("EMBEDDING_BACKEND") or "local").strip().lower()
@@ -707,6 +711,8 @@ class HybridRAGEngine:
             local_embedding_batch_size=int(os.getenv("LOCAL_EMBEDDING_BATCH_SIZE", "8")),
             local_embedding_max_length=int(os.getenv("LOCAL_EMBEDDING_MAX_LENGTH", "2048")),
             store=store,
+            embedder=embedder,
+            llm=llm,
         )
 
     def _new_embedder(self) -> QwenSummaryEmbedder:
@@ -719,6 +725,23 @@ class HybridRAGEngine:
             local_batch_size=self.local_embedding_batch_size,
             local_max_length=self.local_embedding_max_length,
         )
+
+    def warm_collection(self, collection: str, sample_query: str = "영상 장면 검색") -> dict[str, float | int]:
+        timings: dict[str, float | int] = {}
+        total_start = time.perf_counter()
+        if not self.store.collection_exists(collection):
+            raise RuntimeError(f"collection not found: {collection}")
+
+        embed_start = time.perf_counter()
+        self.embedder.embed_query(sample_query)
+        timings["embedding_sec"] = round(time.perf_counter() - embed_start, 3)
+
+        bm25_start = time.perf_counter()
+        payload_records, _bm25_index = self._collection_payloads_and_bm25(collection)
+        timings["bm25_sec"] = round(time.perf_counter() - bm25_start, 3)
+        timings["points_count"] = len(payload_records)
+        timings["total_sec"] = round(time.perf_counter() - total_start, 3)
+        return timings
 
     def ask(self, question: str, collection: str, config: RetrievalConfig) -> dict[str, Any]:
         if not question.strip():

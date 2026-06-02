@@ -658,13 +658,19 @@ def cmd_index(args: argparse.Namespace) -> None:
 
         keyframes_by_shot = {}
         if pending_shots:
-            with timer.step("keyframes", shots=len(pending_shots), workers=keyframe_workers):
+            with timer.step(
+                "keyframes",
+                shots=len(pending_shots),
+                workers=keyframe_workers,
+                save_original=args.save_original_keyframes,
+            ):
                 if keyframe_workers == 1:
                     keyframes_by_shot = select_keyframes_single_pass(
                         video_path=video_path,
                         output_dir=keyframe_dir,
                         candidate_stride=args.candidate_stride,
                         shots=pending_shots,
+                        save_original=args.save_original_keyframes,
                     )
                 else:
                     with ThreadPoolExecutor(max_workers=keyframe_workers) as executor:
@@ -675,6 +681,7 @@ def cmd_index(args: argparse.Namespace) -> None:
                                 keyframe_dir,
                                 args.candidate_stride,
                                 shot,
+                                args.save_original_keyframes,
                             ): shot
                             for shot in pending_shots
                         }
@@ -814,7 +821,9 @@ def cmd_index(args: argparse.Namespace) -> None:
             shot_subtitles = scene["shot_subtitles"]
             scene_vlm, scene_llm, scene_embedder = get_api_clients()
 
-            frame_description = scene_vlm.describe_keyframe(keyframe.image_path)
+            frame_description = scene_vlm.describe_keyframe(
+                keyframe.vlm_image_path or keyframe.image_path
+            )
             if args.skip_llm_summary:
                 summary = SummaryLLMClient.fallback_summary(
                     frame_description,
@@ -837,7 +846,10 @@ def cmd_index(args: argparse.Namespace) -> None:
             }
 
         def process_vlm_stage(scene):
-            frame_description = get_vlm_client().describe_keyframe(scene["keyframe"].image_path)
+            keyframe = scene["keyframe"]
+            frame_description = get_vlm_client().describe_keyframe(
+                keyframe.vlm_image_path or keyframe.image_path
+            )
             return {
                 "shot": scene["shot"],
                 "keyframe": scene["keyframe"],
@@ -1473,6 +1485,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Keyframe workers. 1 uses the single-pass sampler; values above 1 use parallel seeks.",
+    )
+    p_index.add_argument(
+        "--save-original-keyframes",
+        action="store_true",
+        help="Also save full-resolution keyframes. By default only the downscaled VLM/answer image is saved.",
     )
     p_index.add_argument(
         "--api-workers",

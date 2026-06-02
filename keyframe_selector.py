@@ -11,6 +11,10 @@ from models import Keyframe, Shot
 from utils import seconds_to_timestamp
 
 
+VLM_KEYFRAME_MAX_SIDE = 768
+VLM_KEYFRAME_JPEG_QUALITY = 85
+
+
 @dataclass
 class CandidateFrame:
     frame_index: int
@@ -41,10 +45,12 @@ class CentroidKeyframeSelector:
         video_path: str | Path,
         output_dir: str | Path,
         candidate_stride: float = 0.5,
+        save_original: bool = False,
     ):
         self.video_path = Path(video_path)
         self.output_dir = Path(output_dir)
         self.candidate_stride = max(0.1, float(candidate_stride))
+        self.save_original = bool(save_original)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         self.cap = cv2.VideoCapture(str(self.video_path))
@@ -72,6 +78,7 @@ class CentroidKeyframeSelector:
             frame_index=selected.frame_index,
             timestamp_sec=selected.timestamp_sec,
             sharpness=selected.sharpness,
+            save_original=self.save_original,
         )
 
     def _sample_candidates(self, shot: Shot) -> list[CandidateFrame]:
@@ -146,10 +153,26 @@ class CentroidKeyframeSelector:
         frame_index: int,
         timestamp_sec: float,
         sharpness: float,
+        save_original: bool = False,
     ) -> Keyframe:
         timestamp = seconds_to_timestamp(timestamp_sec).replace(":", "-")
         image_path = output_dir / f"shot_{shot.shot_id:04d}_{timestamp}.jpg"
-        cv2.imwrite(str(image_path), frame)
+        vlm_frame = CentroidKeyframeSelector._vlm_frame(frame)
+        if save_original:
+            cv2.imwrite(str(image_path), frame)
+            vlm_image_path = image_path.with_name(f"{image_path.stem}.vlm.jpg")
+            cv2.imwrite(
+                str(vlm_image_path),
+                vlm_frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), VLM_KEYFRAME_JPEG_QUALITY],
+            )
+        else:
+            cv2.imwrite(
+                str(image_path),
+                vlm_frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), VLM_KEYFRAME_JPEG_QUALITY],
+            )
+            vlm_image_path = image_path
 
         return Keyframe(
             shot_id=shot.shot_id,
@@ -158,7 +181,22 @@ class CentroidKeyframeSelector:
             timestamp_str=seconds_to_timestamp(timestamp_sec),
             image_path=str(image_path),
             sharpness=sharpness,
+            vlm_image_path=str(vlm_image_path),
         )
+
+    @staticmethod
+    def _vlm_frame(frame: np.ndarray) -> np.ndarray:
+        height, width = frame.shape[:2]
+        longest_side = max(width, height)
+        if longest_side <= VLM_KEYFRAME_MAX_SIDE:
+            return frame
+
+        scale = VLM_KEYFRAME_MAX_SIDE / float(longest_side)
+        target_size = (
+            max(1, int(round(width * scale))),
+            max(1, int(round(height * scale))),
+        )
+        return cv2.resize(frame, target_size, interpolation=cv2.INTER_AREA)
 
 
 def select_keyframe_for_shot(
@@ -166,11 +204,13 @@ def select_keyframe_for_shot(
     output_dir: str | Path,
     candidate_stride: float,
     shot: Shot,
+    save_original: bool = False,
 ) -> Keyframe:
     selector = CentroidKeyframeSelector(
         video_path=video_path,
         output_dir=output_dir,
         candidate_stride=candidate_stride,
+        save_original=save_original,
     )
     try:
         return selector.select_one(shot)
@@ -183,6 +223,7 @@ def select_keyframes_single_pass(
     output_dir: str | Path,
     candidate_stride: float,
     shots: list[Shot],
+    save_original: bool = False,
 ) -> dict[int, Keyframe]:
     video_path = Path(video_path)
     output_dir = Path(output_dir)
@@ -245,6 +286,7 @@ def select_keyframes_single_pass(
                 frame_index=selected.frame_index,
                 timestamp_sec=selected.timestamp_sec,
                 sharpness=selected.sharpness,
+                save_original=save_original,
             )
 
     _visit_frames_in_order(video_path, sorted(selected_frames), write_selected)

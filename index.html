@@ -24,6 +24,10 @@
       box-sizing: border-box;
     }
 
+    [hidden] {
+      display: none !important;
+    }
+
     body {
       margin: 0;
       background: var(--bg);
@@ -32,6 +36,7 @@
 
     button,
     input,
+    select,
     textarea {
       font: inherit;
     }
@@ -102,6 +107,7 @@
     }
 
     input,
+    select,
     textarea {
       width: 100%;
       border: 1px solid var(--line);
@@ -119,9 +125,15 @@
     }
 
     input:focus,
+    select:focus,
     textarea:focus {
       border-color: var(--accent);
       box-shadow: 0 0 0 3px rgba(37, 111, 91, 0.14);
+    }
+
+    form {
+      display: grid;
+      gap: 16px;
     }
 
     .grid-3 {
@@ -321,6 +333,27 @@
       line-height: 1.55;
     }
 
+    .upload-form {
+      border-top: 1px solid var(--line);
+      padding-top: 18px;
+    }
+
+    .upload-status {
+      min-height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--surface-2);
+      color: var(--muted);
+      padding: 9px 10px;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    .upload-log {
+      max-height: 160px;
+      margin-top: 0;
+    }
+
     .error {
       color: var(--danger);
     }
@@ -371,7 +404,7 @@
           <input id="collection" name="collection" value="video_qna_qwen06b" autocomplete="off">
         </div>
 
-        <div class="grid-3">
+        <div class="grid-3" hidden>
           <div class="field">
             <label for="topK">Top K</label>
             <input id="topK" name="topK" type="number" min="1" max="20" value="4">
@@ -386,7 +419,7 @@
           </div>
         </div>
 
-        <div class="checks">
+        <div class="checks" hidden>
           <label class="check" for="useExpansion">
             <input id="useExpansion" name="useExpansion" type="checkbox" checked>
             LLM expansion
@@ -398,6 +431,38 @@
         </div>
 
         <button id="submitButton" class="submit" type="submit">질문하기</button>
+      </form>
+
+      <form id="uploadForm" class="upload-form">
+        <div class="field">
+          <label for="videoFile">Video Upload</label>
+          <input id="videoFile" name="video" type="file" accept="video/*" required>
+        </div>
+
+        <div class="field">
+          <label for="uploadCollection">New Collection</label>
+          <input id="uploadCollection" name="collection" autocomplete="off" placeholder="auto">
+        </div>
+
+        <div class="field">
+          <label for="uploadLanguage">Lang</label>
+          <select id="uploadLanguage" name="language">
+            <option value="auto">auto</option>
+            <option value="ja">ja</option>
+            <option value="ko">ko</option>
+            <option value="en">en</option>
+          </select>
+        </div>
+
+        <div hidden>
+          <input id="uploadWorkers" name="api_workers" type="number" min="1" max="32" value="15">
+          <input id="uploadBatch" name="scene_batch_size" type="number" min="1" max="5" value="5">
+          <input id="uploadMaxShots" name="max_shots" type="number" min="0" value="0">
+        </div>
+
+        <button id="uploadButton" class="submit" type="submit">업로드 인덱싱</button>
+        <div id="uploadStatus" class="upload-status">대기</div>
+        <pre id="uploadLog" class="upload-log"></pre>
       </form>
     </aside>
 
@@ -443,6 +508,11 @@
     const debugStateEl = document.getElementById("debugState");
     const elapsedEl = document.getElementById("elapsed");
     const submitButton = document.getElementById("submitButton");
+    const uploadForm = document.getElementById("uploadForm");
+    const uploadButton = document.getElementById("uploadButton");
+    const uploadStatus = document.getElementById("uploadStatus");
+    const uploadLog = document.getElementById("uploadLog");
+    let uploadPollTimer = null;
 
     function mediaUrl(path) {
       if (!path) return "";
@@ -548,6 +618,85 @@
         health.dataset.state = "error";
       }
     }
+
+    function renderUploadJob(job) {
+      const bits = [
+        `status: ${text(job.status)}`,
+        `collection: ${text(job.collection)}`,
+      ];
+      if (job.started_at) bits.push(`started: ${job.started_at}`);
+      if (job.finished_at) bits.push(`finished: ${job.finished_at}`);
+      if (job.error) bits.push(`error: ${job.error}`);
+      uploadStatus.textContent = bits.join(" | ");
+      uploadLog.textContent = job.log_tail || "";
+      uploadLog.scrollTop = uploadLog.scrollHeight;
+
+      if (job.status === "done") {
+        document.getElementById("collection").value = job.collection || "";
+        uploadButton.disabled = false;
+        uploadButton.textContent = "업로드 인덱싱";
+        if (uploadPollTimer) clearInterval(uploadPollTimer);
+        uploadPollTimer = null;
+      }
+      if (job.status === "error") {
+        uploadButton.disabled = false;
+        uploadButton.textContent = "업로드 인덱싱";
+        if (uploadPollTimer) clearInterval(uploadPollTimer);
+        uploadPollTimer = null;
+      }
+    }
+
+    async function pollUploadJob(jobId) {
+      const response = await fetch(`/jobs/${encodeURIComponent(jobId)}`);
+      const job = await response.json();
+      if (!response.ok) {
+        throw new Error(typeof job.detail === "string" ? job.detail : JSON.stringify(job.detail));
+      }
+      renderUploadJob(job);
+    }
+
+    uploadForm.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (uploadPollTimer) clearInterval(uploadPollTimer);
+
+      const formData = new FormData();
+      const video = document.getElementById("videoFile").files[0];
+      if (!video) return;
+      formData.append("video", video);
+      formData.append("collection", document.getElementById("uploadCollection").value.trim());
+      formData.append("language", document.getElementById("uploadLanguage").value);
+      formData.append("api_workers", document.getElementById("uploadWorkers").value || "15");
+      formData.append("scene_batch_size", document.getElementById("uploadBatch").value || "5");
+      formData.append("max_shots", document.getElementById("uploadMaxShots").value || "0");
+
+      uploadButton.disabled = true;
+      uploadButton.textContent = "업로드 중";
+      uploadStatus.textContent = "uploading";
+      uploadLog.textContent = "";
+
+      try {
+        const response = await fetch("/upload", {
+          method: "POST",
+          body: formData
+        });
+        const job = await response.json();
+        if (!response.ok) {
+          throw new Error(typeof job.detail === "string" ? job.detail : JSON.stringify(job.detail));
+        }
+        uploadButton.textContent = "인덱싱 중";
+        renderUploadJob(job);
+        uploadPollTimer = setInterval(() => {
+          pollUploadJob(job.job_id).catch((error) => {
+            uploadStatus.textContent = error.message || "상태 확인 실패";
+          });
+        }, 3000);
+      } catch (error) {
+        uploadStatus.textContent = error.message || "업로드 실패";
+        uploadStatus.classList.add("error");
+        uploadButton.disabled = false;
+        uploadButton.textContent = "업로드 인덱싱";
+      }
+    });
 
     form.addEventListener("submit", async (event) => {
       event.preventDefault();

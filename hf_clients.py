@@ -21,6 +21,10 @@ JSON_RETRY_PROMPT = (
 NO_REASONING_EXTRA_BODY = {"reasoning": {"enabled": False}}
 
 
+def _vlm_image_path(keyframe: Any) -> str | Path:
+    return getattr(keyframe, "vlm_image_path", None) or keyframe.image_path
+
+
 def _env_float(name: str, default: float) -> float:
     value = os.getenv(name)
     if value is None or not value.strip():
@@ -473,6 +477,8 @@ class SummaryLLMClient:
                     "or subtitle-mentioned character rather than a hard fact. "
                     "Do not invent facts, names, emotions, places, relationships, or story context "
                     "that are not supported by the input. Return only one valid JSON object. "
+                    "Keep every field concise so the JSON is complete and parseable. "
+                    "Do not include search_text in the JSON; it will be generated locally. "
                     "Do not include markdown or reasoning."
                 ),
             },
@@ -490,15 +496,9 @@ class SummaryLLMClient:
                     "- places: array of visible or mentioned places/settings\n"
                     "- visual_keywords: array of Korean visual search terms and useful synonyms\n"
                     "- dialogue_keywords: array of important subtitle terms, names, topics, questions, goals, or events\n"
-                    "- search_text: one Korean string with 5-8 short newline-separated lines optimized for retrieval\n\n"
-                    "Search text rules:\n"
-                    "- Use labels like 요약:, 행동:, 인물:, 사물:, 장소:, 화면 키워드:, 대사 키워드: when available.\n"
-                    "- Include the summary first and make every line useful as a standalone search clue.\n"
-                    "- Do not include unavailable categories in search_text; never write 없음/해당 없음 lines.\n"
-                    "- Repeat the most important nouns/verbs naturally 1-2 times, but do not add unrelated keyword spam.\n"
-                    "- Add common Korean synonyms only when they are faithful to the evidence.\n"
-                    "- If subtitles are empty, keep dialogue_keywords as [] and focus search_text on visual evidence.\n"
-                    "- Avoid poetic language; use terms a user would type in a video search question.\n\n"
+                    "- do not return search_text; Python will build it locally\n"
+                    "- summary/context must be short; arrays should stay under 10 items\n"
+                    "- search_text: omit this field; Python will generate retrieval text locally\n\n"
                     "Return exactly one JSON object and no markdown. /no_think\n\n"
                     f"INPUT_JSON:\n{json.dumps(payload, ensure_ascii=False)}"
                 ),
@@ -508,7 +508,7 @@ class SummaryLLMClient:
             data = self.chat.chat_json(
                 self.model,
                 messages,
-                max_tokens=1200,
+                max_tokens=900,
                 response_format={"type": "json_object"},
                 extra_body=NO_REASONING_EXTRA_BODY,
             )
@@ -521,25 +521,23 @@ class SummaryLLMClient:
 
         summary = SceneSummary(
             summary=ensure_str(data.get("summary")),
-            action=_unique_str_list(data.get("action"), limit=12),
+            action=_unique_str_list(data.get("action"), limit=6),
             context=ensure_str(data.get("context")),
-            emotion=_unique_str_list(data.get("emotion"), limit=8),
-            people=_unique_str_list(data.get("people"), limit=15),
-            objects=_unique_str_list(data.get("objects"), limit=20),
-            places=_unique_str_list(data.get("places"), limit=12),
-            visual_keywords=_unique_str_list(data.get("visual_keywords"), limit=25),
-            dialogue_keywords=_unique_str_list(data.get("dialogue_keywords"), limit=25),
-            search_text=_clean_search_text(data.get("search_text")),
+            emotion=_unique_str_list(data.get("emotion"), limit=6),
+            people=_unique_str_list(data.get("people"), limit=8),
+            objects=_unique_str_list(data.get("objects"), limit=8),
+            places=_unique_str_list(data.get("places"), limit=8),
+            visual_keywords=_unique_str_list(data.get("visual_keywords"), limit=10),
+            dialogue_keywords=_unique_str_list(data.get("dialogue_keywords"), limit=10),
         )
         if not summary.summary:
             print("[warn] LLM summary JSON omitted summary; using fallback summary.")
             return self.fallback_summary(frame_description, shot_subtitles)
-        if not summary.search_text:
-            summary.search_text = self.search_text_from_summary(
-                summary,
-                frame_description,
-                shot_subtitles,
-            )
+        summary.search_text = self.search_text_from_summary(
+            summary,
+            frame_description,
+            shot_subtitles,
+        )
         return summary
 
     @staticmethod
@@ -680,7 +678,7 @@ class UnifiedSceneClient:
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": VideoVLMClient._image_data_url(scene["keyframe"].image_path)
+                        "url": VideoVLMClient._image_data_url(_vlm_image_path(scene["keyframe"]))
                     },
                 }
             )
@@ -714,8 +712,9 @@ class UnifiedSceneClient:
                     "character glossary to produce the final scene JSON. Do not let subtitles "
                     "change what is visibly present in frame_description. If a name is only "
                     "implied by subtitles or glossary clues, phrase it conservatively. Do not "
-                    "invent facts, relationships, emotions, places, or names. Return only one "
-                    "valid JSON object."
+                    "invent facts, relationships, emotions, places, or names. Keep every field "
+                    "concise so the JSON is complete and parseable. Do not include search_text "
+                    "in scene objects; it will be generated locally. Return only one valid JSON object."
                 ),
             },
             {
@@ -738,10 +737,12 @@ class UnifiedSceneClient:
                             "- places: array of visible or mentioned places/settings\n"
                             "- visual_keywords: Korean visual search terms and useful synonyms\n"
                             "- dialogue_keywords: important subtitle terms, names, topics, goals, or events\n"
-                            "- search_text: one Korean string with short newline-separated retrieval lines\n\n"
+                            "- search_text: omit this field; Python will generate retrieval text locally\n\n"
+                            "Length limits per scene: frame_description is 1 short sentence; "
+                            "summary is at most 2 short Korean sentences; context is at most "
+                            "1 short Korean sentence; arrays should stay under 10 items. "
                             "Do not output the intermediate two-pass notes. Only output the final JSON. "
-                            "Search_text should use labels such as 요약:, 행동:, 인물:, 사물:, 장소:, "
-                            "화면 키워드:, 대사 키워드:. Never include 없음/해당 없음 lines. "
+                            "Do not add extra fields, especially search_text. "
                             "Return exactly one JSON object and no markdown. /no_think"
                         ),
                     },
@@ -751,7 +752,7 @@ class UnifiedSceneClient:
         data = self.chat.chat_json(
             self.model,
             messages,
-            max_tokens=max(1200, 650 * len(scenes)),
+            max_tokens=max(900, 450 * len(scenes)),
             response_format={"type": "json_object"},
             extra_body=NO_REASONING_EXTRA_BODY,
         )
@@ -793,12 +794,12 @@ class UnifiedSceneClient:
             frame_description=ensure_str(
                 item.get("frame_description") or item.get("description") or item.get("summary")
             ),
-            visible_objects=_unique_str_list(item.get("objects") or item.get("visible_objects"), limit=12),
-            visible_actions=_unique_str_list(item.get("action") or item.get("visible_actions"), limit=12),
-            people=_unique_str_list(item.get("people"), limit=12),
+            visible_objects=_unique_str_list(item.get("objects") or item.get("visible_objects"), limit=8),
+            visible_actions=_unique_str_list(item.get("action") or item.get("visible_actions"), limit=6),
+            people=_unique_str_list(item.get("people"), limit=8),
             setting=ensure_str(item.get("setting") or item.get("context")),
-            visible_text=_unique_str_list(item.get("visible_text"), limit=12),
-            visual_keywords=_unique_str_list(item.get("visual_keywords"), limit=20),
+            visible_text=_unique_str_list(item.get("visible_text"), limit=8),
+            visual_keywords=_unique_str_list(item.get("visual_keywords"), limit=10),
         )
 
     @staticmethod
@@ -809,24 +810,22 @@ class UnifiedSceneClient:
     ) -> SceneSummary:
         summary = SceneSummary(
             summary=ensure_str(item.get("summary")),
-            action=_unique_str_list(item.get("action"), limit=12),
+            action=_unique_str_list(item.get("action"), limit=6),
             context=ensure_str(item.get("context")),
-            emotion=_unique_str_list(item.get("emotion"), limit=8),
-            people=_unique_str_list(item.get("people"), limit=15),
-            objects=_unique_str_list(item.get("objects"), limit=20),
-            places=_unique_str_list(item.get("places"), limit=12),
-            visual_keywords=_unique_str_list(item.get("visual_keywords"), limit=25),
-            dialogue_keywords=_unique_str_list(item.get("dialogue_keywords"), limit=25),
-            search_text=_clean_search_text(item.get("search_text")),
+            emotion=_unique_str_list(item.get("emotion"), limit=6),
+            people=_unique_str_list(item.get("people"), limit=8),
+            objects=_unique_str_list(item.get("objects"), limit=8),
+            places=_unique_str_list(item.get("places"), limit=8),
+            visual_keywords=_unique_str_list(item.get("visual_keywords"), limit=10),
+            dialogue_keywords=_unique_str_list(item.get("dialogue_keywords"), limit=10),
         )
         if not summary.summary:
             return SummaryLLMClient.fallback_summary(frame_description, shot_subtitles)
-        if not summary.search_text:
-            summary.search_text = SummaryLLMClient.search_text_from_summary(
-                summary,
-                frame_description,
-                shot_subtitles,
-            )
+        summary.search_text = SummaryLLMClient.search_text_from_summary(
+            summary,
+            frame_description,
+            shot_subtitles,
+        )
         return summary
 
 

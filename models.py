@@ -36,6 +36,7 @@ class Keyframe:
     timestamp_str: str
     image_path: str
     sharpness: float
+    vlm_image_path: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
